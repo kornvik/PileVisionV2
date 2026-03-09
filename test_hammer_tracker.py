@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
 from collections import namedtuple
 
-from hammer_tracker import BlowDetector, IMUCompensator, estimate_pose, IMPACT_VELOCITY_THRESHOLD
+from hammer_tracker import BlowDetector, IMUHelper, estimate_pose, IMPACT_VELOCITY_THRESHOLD
 
 
 # ============================================================
@@ -222,159 +222,427 @@ class TestBlowDetector:
             d.update(float(i), 1.0 + 0.01 * i)
         assert len(d.history) == 10  # maxlen=10
 
+    def test_weighted_averaging_weights_noisy_frames_less(self):
+        """Noisy frames (low weight) should contribute less to rest average."""
+        d = self.make_detector()
+        dt = 1.0 / 60
+
+        # First blow
+        d.update(0.0, 1.0)
+        d.update(2.5, 2.0)
+        d.update(3.0, 2.0)
+        _, blow, _, _ = d.update(3.05, 0.5)
+        assert blow is True
+
+        # Settle phase
+        t = 3.1
+        for _ in range(15):
+            d.update(t, 1.0)
+            t += dt
+
+        # Averaging phase: alternate 1.000m (weight=1.0) and 1.001m (weight=0.01)
+        # Small height diff keeps velocity < SETTLE_VELOCITY
+        # Unweighted mean would be ~1.0005, weighted should be ~1.0000
+        for i in range(d.REST_AVG_FRAMES):
+            if i % 2 == 0:
+                d.update(t, 1.001, stillness_weight=0.01)
+            else:
+                d.update(t, 1.000, stillness_weight=1.0)
+            t += dt
+
+        assert d._rest_height is not None
+        # Weighted avg pulled toward 1.000 (high weight), not 1.0005 (unweighted)
+        assert d._rest_height < 1.0003
+
+    def test_zero_weight_frames_excluded(self):
+        """Frames with zero weight should not be collected."""
+        d = self.make_detector()
+        dt = 1.0 / 60
+
+        # First blow
+        d.update(0.0, 1.0)
+        d.update(2.5, 2.0)
+        d.update(3.0, 2.0)
+        d.update(3.05, 0.5)
+
+        # Settle
+        t = 3.1
+        for _ in range(15):
+            d.update(t, 1.0)
+            t += dt
+
+        # All zero weight → nothing collected
+        samples_before = len(d._rest_samples)
+        for _ in range(10):
+            d.update(t, 1.0, stillness_weight=0.0)
+            t += dt
+
+        assert len(d._rest_samples) == samples_before
+
+    def test_default_weight_is_one(self):
+        """Default stillness_weight=1.0 for backward compatibility."""
+        d = self.make_detector()
+        dt = 1.0 / 60
+
+        # First blow
+        d.update(0.0, 1.0)
+        d.update(2.5, 2.0)
+        d.update(3.0, 2.0)
+        d.update(3.05, 0.5)
+
+        # Rest — no weight arg → defaults to 1.0, all frames collected
+        t = 3.1
+        for _ in range(50):
+            d.update(t, 1.0)
+            t += dt
+
+        assert d._awaiting_rest is False
+
 
 # ============================================================
 # IMUCompensator Tests
 # ============================================================
 
-class TestIMUCompensator:
+class TestIMUHelper:
 
-    def make_imu_packet(self, accel_samples):
-        """Create a mock IMU packet with given accel samples.
-        Each sample is (x, y, z, timestamp_seconds).
+    @staticmethod
+    def pitch_to_quat(pitch_rad):
+        """Convert a pitch angle (rotation around X) to quaternion (i,j,k,real)."""
+        half = pitch_rad / 2.0
+        return np.sin(half), 0.0, 0.0, np.cos(half)
+
+    def make_imu_packet(self, samples):
+        """Create a mock BNO085 fused IMU packet.
+        Each sample is (pitch_rad, lin_accel_x, lin_accel_y, lin_accel_z).
         """
         packet = MagicMock()
         imu_datas = []
-        for ax, ay, az, ts in accel_samples:
+        for pitch_rad, lax, lay, laz in samples:
             imu_data = MagicMock()
-            imu_data.acceleroMeter.x = ax
-            imu_data.acceleroMeter.y = ay
-            imu_data.acceleroMeter.z = az
-            td = MagicMock()
-            td.total_seconds.return_value = ts
-            imu_data.acceleroMeter.getTimestampDevice.return_value = td
+            qi, qj, qk, qr = self.pitch_to_quat(pitch_rad)
+            imu_data.rotationVector.i = qi
+            imu_data.rotationVector.j = qj
+            imu_data.rotationVector.k = qk
+            imu_data.rotationVector.real = qr
+            imu_data.linearAcceleration.x = lax
+            imu_data.linearAcceleration.y = lay
+            imu_data.linearAcceleration.z = laz
             imu_datas.append(imu_data)
         packet.packets = imu_datas
         return packet
 
     def test_initial_state(self):
-        comp = IMUCompensator()
-        assert comp.is_ready is False
-        assert np.allclose(comp.velocity, [0, 0, 0])
-        assert np.allclose(comp.displacement, [0, 0, 0])
+        h = IMUHelper()
+        assert h.is_ready is False
+        assert h.pitch == 0.0
+        assert h.baseline_pitch == 0.0
 
     def test_calibration_phase(self):
-        """Compensator should not be ready until CALIB_COUNT samples collected."""
-        comp = IMUCompensator()
-        comp.CALIB_COUNT = 10  # reduce for test speed
+        """Helper should not be ready until CALIB_COUNT samples collected."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 10
 
-        # Feed 9 stationary samples (gravity = 0, -9.81, 0 for example)
-        samples = [(0, -9.81, 0, 0.001 * i) for i in range(9)]
-        comp.add_imu_packet(self.make_imu_packet(samples))
-        comp.get_correction()
-        assert comp.is_ready is False
+        # 9 samples — not enough
+        samples = [(0.0, 0, 0, 0)] * 9
+        h.add_imu_packet(self.make_imu_packet(samples))
+        h.get_tilt_correction(np.array([0, 0, 5.0]))
+        assert h.is_ready is False
 
-        # Feed 1 more → should calibrate
-        comp.add_imu_packet(self.make_imu_packet([(0, -9.81, 0, 0.01)]))
-        comp.get_correction()
-        assert comp.is_ready is True
+        # 1 more → calibrated
+        h.add_imu_packet(self.make_imu_packet([(0.0, 0, 0, 0)]))
+        h.get_tilt_correction(np.array([0, 0, 5.0]))
+        assert h.is_ready is True
 
-    def test_gravity_estimation(self):
-        """During calibration, gravity vector should be mean of stationary samples."""
-        comp = IMUCompensator()
-        comp.CALIB_COUNT = 5
+    def test_baseline_pitch_estimation(self):
+        """Calibration should average pitch as baseline."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
 
-        # Gravity along Y-axis = -9.81
-        samples = [(0.0, -9.81, 0.0, 0.001 * i) for i in range(5)]
-        comp.add_imu_packet(self.make_imu_packet(samples))
-        comp.get_correction()
+        # Stationary at 1° pitch
+        pitch = np.radians(1.0)
+        samples = [(pitch, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(samples))
+        h.get_tilt_correction(np.array([0, 0, 5.0]))
 
-        assert comp.is_ready is True
-        assert np.allclose(comp.gravity_vec, [0, -9.81, 0], atol=0.01)
+        assert h.is_ready is True
+        assert abs(h.baseline_pitch - pitch) < 0.001
 
-    def test_zero_correction_when_stationary(self):
-        """If camera isn't shaking (accel = gravity), correction should be ~zero."""
-        comp = IMUCompensator()
-        comp.CALIB_COUNT = 5
+    def test_tilt_correction_at_known_angle(self):
+        """0.5° tilt from baseline at 5m depth → ~44mm correction."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
 
-        # Calibration phase
-        calib_samples = [(0, -9.81, 0, 0.001 * i) for i in range(5)]
-        comp.add_imu_packet(self.make_imu_packet(calib_samples))
-        comp.get_correction()
+        # Calibrate at 0° pitch
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h.get_tilt_correction(np.array([0, 0, 5.0]))
 
-        # Post-calibration: feed more stationary samples
-        post_samples = [(0, -9.81, 0, 0.01 + 0.0025 * i) for i in range(20)]
-        comp.add_imu_packet(self.make_imu_packet(post_samples))
-        correction = comp.get_correction()
+        # Now tilted 0.5°
+        target_rad = np.radians(0.5)
+        tilted = [(target_rad, 0, 0, 0)] * 3
+        h.add_imu_packet(self.make_imu_packet(tilted))
 
-        assert np.allclose(correction, [0, 0, 0], atol=0.001)
+        tvec = np.array([[0.0], [-1.0], [5.0]])
+        correction = h.get_tilt_correction(tvec)
 
-    def test_shake_produces_nonzero_correction(self):
-        """Camera shake (accel != gravity) should produce nonzero correction."""
-        comp = IMUCompensator()
-        comp.CALIB_COUNT = 5
+        # Expected: 5.0 * tan(0.5°) ≈ 0.0436m ≈ 43.6mm
+        expected = 5.0 * np.tan(target_rad)
+        assert abs(correction - expected) < 0.001
 
-        # Calibration
-        calib = [(0, -9.81, 0, 0.001 * i) for i in range(5)]
-        comp.add_imu_packet(self.make_imu_packet(calib))
-        comp.get_correction()
+    def test_zero_tilt_when_stationary(self):
+        """Same pitch as baseline → zero correction."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
 
-        # Shake: add 2 m/s² in X direction
-        shake = [(2.0, -9.81, 0, 0.01 + 0.0025 * i) for i in range(20)]
-        comp.add_imu_packet(self.make_imu_packet(shake))
-        correction = comp.get_correction()
+        samples = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(samples))
+        h.get_tilt_correction(np.array([0, 0, 5.0]))
 
-        # X displacement should be positive (accelerated in +X)
-        assert correction[0] > 0
-        # Y and Z should be ~0
-        assert abs(correction[1]) < 0.001
-        assert abs(correction[2]) < 0.001
+        # Still at same pitch
+        post = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(post))
 
-    def test_reset_drift(self):
-        """reset_drift should zero velocity but keep displacement (ground shift)."""
-        comp = IMUCompensator()
-        comp.CALIB_COUNT = 5
+        correction = h.get_tilt_correction(np.array([[0], [-1], [5.0]]))
+        assert abs(correction) < 0.001
 
-        calib = [(0, -9.81, 0, 0.001 * i) for i in range(5)]
-        comp.add_imu_packet(self.make_imu_packet(calib))
-        comp.get_correction()
+    def test_frame_still_when_no_linear_accel(self):
+        """Zero linear acceleration → frame is still."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
 
-        # Add some shake to build up velocity + displacement
-        shake = [(5.0, -9.81, 0, 0.01 + 0.0025 * i) for i in range(10)]
-        comp.add_imu_packet(self.make_imu_packet(shake))
-        comp.get_correction()
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h.is_frame_still()
 
-        disp_before = comp.displacement.copy()
-        comp.reset_drift()
-        assert np.allclose(comp.velocity, [0, 0, 0])
-        # Displacement preserved — tracks real camera movement
-        assert np.allclose(comp.displacement, disp_before)
+        post = [(0.0, 0, 0, 0)] * 3
+        h.add_imu_packet(self.make_imu_packet(post))
 
-    def test_bad_timestamps_skipped(self):
-        """Samples with dt <= 0 or dt > 0.1 should be skipped."""
-        comp = IMUCompensator()
-        comp.CALIB_COUNT = 3
+        assert h.is_frame_still() is True
 
-        # Calibration
-        calib = [(0, -9.81, 0, 0.001 * i) for i in range(3)]
-        comp.add_imu_packet(self.make_imu_packet(calib))
-        comp.get_correction()
+    def test_frame_not_still_high_linear_accel(self):
+        """High linear acceleration → frame is not still."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
 
-        # Bad timestamp: backwards jump
-        bad = [
-            (5.0, -9.81, 0, 0.01),   # first post-calib (sets prev_time)
-            (5.0, -9.81, 0, 0.005),   # dt = -0.005 → skipped
-            (5.0, -9.81, 0, 0.50),    # dt = 0.49 > 0.1 → skipped
-        ]
-        comp.add_imu_packet(self.make_imu_packet(bad))
-        correction = comp.get_correction()
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h.is_frame_still()
 
-        # Only the first sample set prev_time, subsequent were skipped
-        # so displacement should be zero
-        assert np.allclose(correction, [0, 0, 0], atol=0.001)
+        # 2 m/s² linear accel (gravity already removed by BNO085)
+        noisy = [(0.0, 2.0, 0, 0)] * 3
+        h.add_imu_packet(self.make_imu_packet(noisy))
 
-    def test_correction_returns_copy(self):
-        """get_correction should return a copy, not a reference to internal state."""
-        comp = IMUCompensator()
-        comp.CALIB_COUNT = 3
+        assert h.is_frame_still() is False
 
-        calib = [(0, -9.81, 0, 0.001 * i) for i in range(3)]
-        comp.add_imu_packet(self.make_imu_packet(calib))
+    def test_reset_tilt_rebaselines(self):
+        """reset_tilt should set current pitch as new baseline."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
 
-        c1 = comp.get_correction()
-        c1[0] = 999.0
-        c2 = comp.get_correction()
-        assert c2[0] != 999.0
+        # Calibrate at 0°
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h.get_tilt_correction(np.array([0, 0, 5.0]))
+
+        # Tilt to 1°
+        tilted = [(np.radians(1.0), 0, 0, 0)] * 3
+        h.add_imu_packet(self.make_imu_packet(tilted))
+        corr_before = h.get_tilt_correction(np.array([0, 0, 5.0]))
+        assert abs(corr_before) > 0.01  # nonzero correction
+
+        # Reset → current pitch becomes baseline
+        h.reset_tilt()
+        corr_after = h.get_tilt_correction(np.array([0, 0, 5.0]))
+        assert abs(corr_after) < 0.001  # zero after reset
+
+    def test_stillness_weight_stationary(self):
+        """Zero linear accel → weight close to 1.0."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h.get_stillness_weight()
+
+        post = [(0.0, 0, 0, 0)] * 3
+        h.add_imu_packet(self.make_imu_packet(post))
+
+        w = h.get_stillness_weight()
+        assert w > 0.9
+
+    def test_stillness_weight_shaking(self):
+        """High linear accel → weight close to 0."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h.get_stillness_weight()
+
+        # Heavy vibration: 3 m/s² in multiple axes
+        noisy = [(0.0, 3.0, 2.0, 1.0)] * 3
+        h.add_imu_packet(self.make_imu_packet(noisy))
+
+        w = h.get_stillness_weight()
+        assert w < 0.1
+
+    def test_tilt_scales_with_depth(self):
+        """Same tilt at different depths → proportional correction."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h.get_tilt_correction(np.array([0, 0, 5.0]))
+
+        tilted = [(np.radians(0.5), 0, 0, 0)] * 3
+        h.add_imu_packet(self.make_imu_packet(tilted))
+
+        corr_5m = h.get_tilt_correction(np.array([0, 0, 5.0]))
+        corr_10m = h.get_tilt_correction(np.array([0, 0, 10.0]))
+
+        assert abs(corr_10m / corr_5m - 2.0) < 0.01
+
+    def make_zupt_packet(self, samples):
+        """Create mock packet for ZUPT testing.
+        Each sample is (pitch_rad, lax, lay, laz, timestamp_s).
+        Includes timestamp on linearAcceleration for ZUPT integration.
+        """
+        packet = MagicMock()
+        imu_datas = []
+        for pitch_rad, lax, lay, laz, ts in samples:
+            imu_data = MagicMock()
+            qi, qj, qk, qr = self.pitch_to_quat(pitch_rad)
+            imu_data.rotationVector.i = qi
+            imu_data.rotationVector.j = qj
+            imu_data.rotationVector.k = qk
+            imu_data.rotationVector.real = qr
+            imu_data.linearAcceleration.x = lax
+            imu_data.linearAcceleration.y = lay
+            imu_data.linearAcceleration.z = laz
+            td = MagicMock()
+            td.total_seconds.return_value = ts
+            imu_data.linearAcceleration.getTimestampDevice.return_value = td
+            imu_datas.append(imu_data)
+        packet.packets = imu_datas
+        return packet
+
+    def test_zupt_no_movement(self):
+        """Zero accel throughout → zero displacement."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h._process_pending()
+
+        h.start_zupt()
+        # Feed zero accel with timestamps
+        samples = [(0.0, 0, 0, 0, 0.01 + 0.0025 * i) for i in range(40)]
+        h.add_imu_packet(self.make_zupt_packet(samples))
+
+        disp = h.finish_zupt()
+        assert abs(disp) < 0.0001  # essentially zero
+
+    def test_zupt_known_displacement(self):
+        """Impulse that should produce known displacement with ZUPT correction."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h._process_pending()
+
+        h.start_zupt()
+        # Simulate: accelerate down then decelerate (symmetric impulse)
+        # Camera drops and stops. Net displacement but final v=0.
+        # Accel: +2 m/s² for 0.1s, then -2 m/s² for 0.1s
+        # Expected displacement: 2 * 0.5 * 2 * 0.1^2 = 0.02m = 20mm
+        dt = 0.0025
+        samples = []
+        t = 0.01
+        for i in range(40):  # 0.1s at 2 m/s²
+            samples.append((0.0, 0, 2.0, 0, t))
+            t += dt
+        for i in range(40):  # 0.1s at -2 m/s²
+            samples.append((0.0, 0, -2.0, 0, t))
+            t += dt
+        h.add_imu_packet(self.make_zupt_packet(samples))
+
+        disp = h.finish_zupt()
+        # Symmetric impulse → displacement = a * T^2 / 2 where T=0.1
+        # = 2 * 0.1^2 / 2 = 0.01m per half, but symmetric so net ≈ 0.02m
+        # ZUPT corrects drift; the displacement from symmetric accel/decel
+        # is 0.5 * a * t^2 for accel phase = 0.5*2*0.01 = 0.01m
+        assert abs(disp) > 0.005  # nonzero displacement
+        assert abs(disp) < 0.05   # reasonable magnitude
+
+    def test_zupt_removes_constant_bias(self):
+        """Constant bias should be removed by ZUPT correction."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h._process_pending()
+
+        h.start_zupt()
+        # Pure bias: constant 0.05 m/s² (no real movement)
+        # Without ZUPT: would accumulate displacement
+        # With ZUPT: final v must be 0, so bias is removed → displacement ≈ 0
+        dt = 0.0025
+        samples = [(0.0, 0, 0.05, 0, 0.01 + dt * i) for i in range(80)]
+        h.add_imu_packet(self.make_zupt_packet(samples))
+
+        disp = h.finish_zupt()
+        assert abs(disp) < 0.001  # bias removed, near zero
+
+    def test_zupt_accumulates_across_blows(self):
+        """Displacement accumulates across multiple start/finish cycles."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h._process_pending()
+
+        # Two blows, each with symmetric impulse
+        for blow_i in range(2):
+            h.start_zupt()
+            dt = 0.0025
+            t_base = 0.01 + blow_i * 0.5
+            samples = []
+            t = t_base
+            for i in range(40):
+                samples.append((0.0, 0, 2.0, 0, t))
+                t += dt
+            for i in range(40):
+                samples.append((0.0, 0, -2.0, 0, t))
+                t += dt
+            h.add_imu_packet(self.make_zupt_packet(samples))
+            h.finish_zupt()
+
+        # Should have accumulated displacement from both blows
+        total = h.get_displacement_y()
+        assert abs(total) > 0.01  # nonzero accumulated
+
+    def test_zupt_inactive_returns_zero(self):
+        """finish_zupt without start returns zero."""
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+        calib = [(0.0, 0, 0, 0)] * 5
+        h.add_imu_packet(self.make_imu_packet(calib))
+        h._process_pending()
+
+        assert h.finish_zupt() == 0.0
+        assert h.get_displacement_y() == 0.0
+
+    def test_uncalibrated_returns_permissive(self):
+        """Before calibration, tilt correction = 0 and is_frame_still = True."""
+        h = IMUHelper()
+        assert h.get_tilt_correction(np.array([0, 0, 5.0])) == 0.0
+        assert h.is_frame_still() is True
+        assert h.get_stillness_weight() == 1.0
 
 
 # ============================================================

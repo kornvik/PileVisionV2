@@ -92,10 +92,12 @@ def build_pipeline():
     xout.setStreamName("video")
     cam.video.link(xout.input)
 
-    # IMU — 400Hz accelerometer + gyroscope to measure camera shake
+    # IMU — BNO085 fused outputs (hardware sensor fusion, not raw MEMS)
+    # ROTATION_VECTOR: absolute orientation quaternion (accel+gyro+mag fusion)
+    # LINEAR_ACCELERATION: gravity-removed acceleration (fusion-based)
     imu = pipeline.create(dai.node.IMU)
-    imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, 400)
-    imu.enableIMUSensor(dai.IMUSensor.GYROSCOPE_RAW, 400)
+    imu.enableIMUSensor(dai.IMUSensor.ROTATION_VECTOR, 400)
+    imu.enableIMUSensor(dai.IMUSensor.LINEAR_ACCELERATION, 400)
     imu.setBatchReportThreshold(1)
     imu.setMaxBatchReports(10)
 
@@ -151,99 +153,180 @@ def estimate_pose(frame, camera_matrix, dist_coeffs):
 # IMU COMPENSATOR
 # ============================================================
 
-class IMUCompensator:
+class IMUHelper:
     """
-    Uses the OAK-D's built-in IMU to measure camera shake caused by
-    ground vibration from pile driving, then subtracts that shake
-    from the vision-based pose measurement.
+    Uses BNO085 fused outputs for pile driving corrections:
 
-    How it works:
-      1. IMU runs at 400Hz, camera at 60Hz
-      2. Between each camera frame, we accumulate IMU acceleration samples
-      3. Remove gravity (estimated during a short calibration at startup)
-      4. Double-integrate acceleration → camera displacement
-      5. Subtract displacement from tvec → corrected pose
+    1. TILT CORRECTION (ROTATION_VECTOR):
+       BNO085 fuses accel+gyro+mag → absolute orientation quaternion.
+       No manual integration, bounded drift. Extract pitch, then:
+       correction = depth * tan(pitch - baseline_pitch)
 
-    Limitation: double-integrating acceleration drifts over time.
-    We reset the integrator after each blow (hammer is briefly still
-    at peak height) to prevent drift accumulating across blows.
-    This works well for pile driving because each blow cycle is short.
+    2. DISPLACEMENT TRACKING with ZUPT (LINEAR_ACCELERATION):
+       Between rest periods, double-integrate linear acceleration to
+       track camera displacement from ground settlement.
+       At each rest period: velocity must be zero (camera is still).
+       Any residual velocity = drift → correct it (ZUPT).
+       Reset integrator each rest period so drift never accumulates.
+
+    3. STILLNESS WEIGHTING (LINEAR_ACCELERATION magnitude):
+       Weight for rest-period averaging. Quiet frames count more.
+
+    Calibration: collect baseline orientation while stationary at startup.
     """
-
-    GRAVITY = 9.81  # m/s²
 
     def __init__(self):
-        self.gravity_vec      = None   # estimated gravity direction in camera frame
         self.calibrated       = False
-        self.calib_samples    = []
-        self.CALIB_COUNT      = 200    # ~0.5s of samples at 400Hz to estimate gravity
+        self.calib_quats      = []
+        self.CALIB_COUNT      = 200    # ~0.5s at 400Hz
 
-        self.velocity         = np.zeros(3)   # camera velocity (integrated accel)
-        self.displacement     = np.zeros(3)   # camera displacement (integrated velocity)
-        self.prev_imu_time    = None
+        # Baseline pitch from calibration (radians)
+        self.baseline_pitch   = 0.0
+
+        # Latest state from fused IMU
+        self.pitch            = 0.0    # current pitch (radians)
+        self.linear_accel_mag = 0.0    # magnitude of linear acceleration (m/s²)
+
+        # Stillness thresholds
+        self.ACCEL_STILL_THRESHOLD = 0.3  # m/s² — tighter since gravity already removed
+
+        # ZUPT displacement tracking
+        # We only care about vertical (Y) displacement for height correction.
+        # Accumulate accel samples during impact, then ZUPT-correct at next rest.
+        self._zupt_accel_y    = []     # buffered accel_y samples during impact
+        self._zupt_dt         = []     # dt for each sample
+        self._zupt_active     = False  # True = currently integrating (impact phase)
+        self._displacement_y  = 0.0    # accumulated camera displacement (meters)
+        self._prev_time       = None
 
         # Buffer of unprocessed IMU packets
         self.pending = []
+
+    @staticmethod
+    def _quat_to_pitch(i, j, k, real):
+        """Extract pitch (rotation around X axis) from quaternion."""
+        sinp = 2.0 * (real * i + j * k)
+        sinp = np.clip(sinp, -1.0, 1.0)
+        return float(np.arcsin(sinp))
 
     def add_imu_packet(self, packet):
         """Called for every IMU packet received from the device."""
         self.pending.append(packet)
 
     def _process_pending(self):
-        """Integrate all pending IMU samples up to now."""
+        """Process all pending IMU packets."""
         for packet in self.pending:
             for imu_data in packet.packets:
-                accel = imu_data.acceleroMeter
-                t     = imu_data.acceleroMeter.getTimestampDevice().total_seconds()
+                # Rotation vector → quaternion (i, j, k, real)
+                rv = imu_data.rotationVector
+                self.pitch = self._quat_to_pitch(rv.i, rv.j, rv.k, rv.real)
 
-                a = np.array([accel.x, accel.y, accel.z])
+                # Linear acceleration (gravity already removed by BNO085)
+                la = imu_data.linearAcceleration
+                self.linear_accel_mag = float(np.sqrt(
+                    la.x**2 + la.y**2 + la.z**2))
 
-                # Phase 1: calibration — collect samples to estimate gravity
+                # Calibration: collect baseline orientation
                 if not self.calibrated:
-                    self.calib_samples.append(a)
-                    if len(self.calib_samples) >= self.CALIB_COUNT:
-                        # Gravity = mean acceleration when stationary
-                        self.gravity_vec = np.mean(self.calib_samples, axis=0)
-                        self.calibrated  = True
-                        print(f"IMU calibrated. Gravity vector: {self.gravity_vec}")
+                    self.calib_quats.append(self.pitch)
+                    if len(self.calib_quats) >= self.CALIB_COUNT:
+                        self.baseline_pitch = float(np.mean(self.calib_quats))
+                        self.calibrated = True
+                        print(f"IMU calibrated. Baseline pitch: "
+                              f"{np.degrees(self.baseline_pitch):.2f}°")
                     continue
 
-                if self.prev_imu_time is None:
-                    self.prev_imu_time = t
-                    continue
-
-                dt = t - self.prev_imu_time
-                self.prev_imu_time = t
-
-                if dt <= 0 or dt > 0.1:   # skip bad timestamps
-                    continue
-
-                # Remove gravity to get pure linear acceleration (camera shake)
-                linear_accel = a - self.gravity_vec
-
-                # Integrate: accel → velocity → displacement
-                self.velocity     += linear_accel * dt
-                self.displacement += self.velocity * dt
+                # ZUPT: buffer accel samples when active
+                if self._zupt_active:
+                    t = imu_data.linearAcceleration.getTimestampDevice() \
+                        .total_seconds()
+                    if self._prev_time is not None:
+                        dt = t - self._prev_time
+                        if 0 < dt < 0.1:
+                            self._zupt_accel_y.append(la.y)
+                            self._zupt_dt.append(dt)
+                    self._prev_time = t
 
         self.pending.clear()
 
-    def get_correction(self):
+    def start_zupt(self):
+        """Start recording accel for displacement tracking (call at blow)."""
+        self._zupt_active = True
+        self._zupt_accel_y.clear()
+        self._zupt_dt.clear()
+        self._prev_time = None
+
+    def finish_zupt(self):
         """
-        Returns camera displacement vector to subtract from tvec.
-        Call once per camera frame after add_imu_packet calls.
+        End displacement tracking (call when camera settles).
+        Apply ZUPT correction: final velocity must be zero.
+        Returns the vertical displacement in meters.
+        """
+        self._process_pending()
+
+        if not self._zupt_active or len(self._zupt_accel_y) < 2:
+            self._zupt_active = False
+            return 0.0
+
+        self._zupt_active = False
+
+        accel = np.array(self._zupt_accel_y)
+        dt_arr = np.array(self._zupt_dt)
+
+        # Raw double integration
+        velocity = np.cumsum(accel * dt_arr)
+        # ZUPT: final velocity should be zero → subtract linear ramp
+        # This removes constant bias drift
+        drift_rate = velocity[-1] / np.sum(dt_arr)
+        t_cumul = np.cumsum(dt_arr)
+        velocity_corrected = velocity - drift_rate * t_cumul
+
+        # Integrate corrected velocity → displacement
+        displacement = np.sum(velocity_corrected * dt_arr)
+
+        self._displacement_y += displacement
+        self._zupt_accel_y.clear()
+        self._zupt_dt.clear()
+
+        return displacement
+
+    def get_displacement_y(self):
+        """Total accumulated vertical camera displacement (meters)."""
+        return self._displacement_y
+
+    def get_tilt_correction(self, tvec):
+        """
+        Returns height correction in meters based on pitch change
+        from baseline. Uses tvec[2] (depth) to scale:
+          correction = depth * tan(pitch - baseline)
         """
         self._process_pending()
         if not self.calibrated:
-            return np.zeros(3)
-        return self.displacement.copy()
+            return 0.0
+        depth = float(np.asarray(tvec).flatten()[2])
+        delta_pitch = self.pitch - self.baseline_pitch
+        return depth * np.tan(delta_pitch)
 
-    def reset_drift(self):
+    def is_frame_still(self):
+        """Returns True if linear acceleration is below threshold."""
+        self._process_pending()
+        if not self.calibrated:
+            return True
+        return bool(self.linear_accel_mag < self.ACCEL_STILL_THRESHOLD)
+
+    def get_stillness_weight(self):
         """
-        Reset velocity integrator to prevent drift accumulation.
-        Displacement is kept — it tracks real camera movement from
-        ground settlement during pile driving.
+        Returns weight 0..1 based on linear acceleration magnitude.
+        1.0 = still, approaches 0 = heavy vibration.
         """
-        self.velocity = np.zeros(3)
+        self._process_pending()
+        if not self.calibrated:
+            return 1.0
+        return float(np.exp(-self.linear_accel_mag / self.ACCEL_STILL_THRESHOLD))
+
+    def reset_tilt(self):
+        """Re-baseline pitch to current orientation."""
+        self.baseline_pitch = self.pitch
 
     @property
     def is_ready(self):
@@ -298,12 +381,12 @@ class BlowDetector:
         self.REST_AVG_FRAMES   = 30     # frames to average (~0.5s at 60fps)
 
         self._settle_count     = 0      # consecutive frames below SETTLE_VELOCITY
-        self._rest_samples     = []     # height samples during rest averaging
+        self._rest_samples     = []     # (height, weight) tuples during rest averaging
         self._awaiting_rest    = False  # True after blow, waiting to collect rest height
         self._last_rest_height = None   # averaged rest height from previous blow
         self._rest_height      = None   # averaged rest height from current blow (for display)
 
-    def update(self, timestamp, height):
+    def update(self, timestamp, height, stillness_weight=1.0):
         velocity = 0.0
 
         if self.prev_height is not None and self.prev_time is not None:
@@ -333,11 +416,14 @@ class BlowDetector:
                 self._settle_count = 0
                 self._rest_samples.clear()
 
-            if self._settle_count >= self.SETTLE_FRAMES:
-                self._rest_samples.append(height)
+            # Weighted averaging: still frames contribute more, noisy less
+            if self._settle_count >= self.SETTLE_FRAMES and stillness_weight > 0:
+                self._rest_samples.append((height, stillness_weight))
 
             if len(self._rest_samples) >= self.REST_AVG_FRAMES:
-                rest_h = np.mean(self._rest_samples)
+                heights = np.array([h for h, w in self._rest_samples])
+                weights = np.array([w for h, w in self._rest_samples])
+                rest_h = np.average(heights, weights=weights)
                 self._rest_height = rest_h
 
                 if self._last_rest_height is not None:
@@ -417,7 +503,7 @@ def main():
         q            = device.getOutputQueue("video", maxSize=4, blocking=False)
         imu_q        = device.getOutputQueue("imu",   maxSize=50, blocking=False)
         blow_detector  = BlowDetector()
-        imu_compensator = IMUCompensator()
+        imu_helper     = IMUHelper()
 
         # CSV logging — use a reference so we can close in finally
         csv_file = open(OUTPUT_CSV, "w", newline="")
@@ -443,7 +529,7 @@ def main():
                     imu_pkt = imu_q.tryGet()
                     if imu_pkt is None:
                         break
-                    imu_compensator.add_imu_packet(imu_pkt)
+                    imu_helper.add_imu_packet(imu_pkt)
 
                 rvec, tvec, inlier_ratio, frame = estimate_pose(
                     frame, camera_matrix, dist_coeffs)
@@ -454,25 +540,31 @@ def main():
                 height        = None
 
                 if tvec is not None:
-                    # Apply IMU camera-shake correction
-                    if imu_compensator.is_ready:
-                        correction = imu_compensator.get_correction()
-                        tvec       = tvec.flatten() - correction
-                        tvec       = tvec.reshape(3, 1)
-
                     # tvec[1] = vertical axis, negate so up = positive
-                    height = -float(tvec[1])
+                    # Apply tilt correction + accumulated displacement
+                    tilt_corr = imu_helper.get_tilt_correction(tvec)
+                    disp_corr = imu_helper.get_displacement_y()
+                    height = -float(tvec[1]) + tilt_corr - disp_corr
 
-                    velocity, blow, set_per_blow, drop_available = blow_detector.update(timestamp, height)
+                    # Weighted averaging: stillness weight from IMU
+                    weight = imu_helper.get_stillness_weight()
+                    velocity, blow, set_per_blow, drop_available = blow_detector.update(
+                        timestamp, height, stillness_weight=weight)
 
-                    # Reset IMU integrator when hammer is moving slowly (at peak of lift)
-                    # This prevents drift from accumulating across blows
-                    if abs(velocity) < 0.05:
-                        imu_compensator.reset_drift()
+                    # ZUPT: start tracking on blow, finish when settled
+                    if blow:
+                        imu_helper.start_zupt()
+                    if blow_detector._awaiting_rest and \
+                       blow_detector._settle_count == blow_detector.SETTLE_FRAMES:
+                        imu_helper.finish_zupt()
+
+                    # Reset tilt baseline when vision is confident during rest
+                    if inlier_ratio > 0.7 and abs(velocity) < 0.10:
+                        imu_helper.reset_tilt()
 
                     # IMU status
-                    imu_status = "IMU OK" if imu_compensator.is_ready else "IMU calibrating..."
-                    imu_color  = (0, 255, 0) if imu_compensator.is_ready else (0, 165, 255)
+                    imu_status = "IMU OK" if imu_helper.is_ready else "IMU calibrating..."
+                    imu_color  = (0, 255, 0) if imu_helper.is_ready else (0, 165, 255)
                     cv2.putText(frame, imu_status,
                                 (10, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, imu_color, 2)
 
