@@ -92,6 +92,17 @@ def build_pipeline():
     xout.setStreamName("video")
     cam.video.link(xout.input)
 
+    # IMU — 400Hz accelerometer + gyroscope to measure camera shake
+    imu = pipeline.create(dai.node.IMU)
+    imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, 400)
+    imu.enableIMUSensor(dai.IMUSensor.GYROSCOPE_RAW, 400)
+    imu.setBatchReportThreshold(1)
+    imu.setMaxBatchReports(10)
+
+    imu_xout = pipeline.create(dai.node.XLinkOut)
+    imu_xout.setStreamName("imu")
+    imu.out.link(imu_xout.input)
+
     return pipeline
 
 
@@ -137,8 +148,109 @@ def estimate_pose(frame, camera_matrix, dist_coeffs):
 
 
 # ============================================================
-# BLOW DETECTOR
+# IMU COMPENSATOR
 # ============================================================
+
+class IMUCompensator:
+    """
+    Uses the OAK-D's built-in IMU to measure camera shake caused by
+    ground vibration from pile driving, then subtracts that shake
+    from the vision-based pose measurement.
+
+    How it works:
+      1. IMU runs at 400Hz, camera at 60Hz
+      2. Between each camera frame, we accumulate IMU acceleration samples
+      3. Remove gravity (estimated during a short calibration at startup)
+      4. Double-integrate acceleration → camera displacement
+      5. Subtract displacement from tvec → corrected pose
+
+    Limitation: double-integrating acceleration drifts over time.
+    We reset the integrator after each blow (hammer is briefly still
+    at peak height) to prevent drift accumulating across blows.
+    This works well for pile driving because each blow cycle is short.
+    """
+
+    GRAVITY = 9.81  # m/s²
+
+    def __init__(self):
+        self.gravity_vec      = None   # estimated gravity direction in camera frame
+        self.calibrated       = False
+        self.calib_samples    = []
+        self.CALIB_COUNT      = 200    # ~0.5s of samples at 400Hz to estimate gravity
+
+        self.velocity         = np.zeros(3)   # camera velocity (integrated accel)
+        self.displacement     = np.zeros(3)   # camera displacement (integrated velocity)
+        self.prev_imu_time    = None
+
+        # Buffer of unprocessed IMU packets
+        self.pending = []
+
+    def add_imu_packet(self, packet):
+        """Called for every IMU packet received from the device."""
+        self.pending.append(packet)
+
+    def _process_pending(self):
+        """Integrate all pending IMU samples up to now."""
+        for packet in self.pending:
+            for imu_data in packet.packets:
+                accel = imu_data.acceleroMeter
+                t     = imu_data.acceleroMeter.getTimestampDevice().total_seconds()
+
+                a = np.array([accel.x, accel.y, accel.z])
+
+                # Phase 1: calibration — collect samples to estimate gravity
+                if not self.calibrated:
+                    self.calib_samples.append(a)
+                    if len(self.calib_samples) >= self.CALIB_COUNT:
+                        # Gravity = mean acceleration when stationary
+                        self.gravity_vec = np.mean(self.calib_samples, axis=0)
+                        self.calibrated  = True
+                        print(f"IMU calibrated. Gravity vector: {self.gravity_vec}")
+                    continue
+
+                if self.prev_imu_time is None:
+                    self.prev_imu_time = t
+                    continue
+
+                dt = t - self.prev_imu_time
+                self.prev_imu_time = t
+
+                if dt <= 0 or dt > 0.1:   # skip bad timestamps
+                    continue
+
+                # Remove gravity to get pure linear acceleration (camera shake)
+                linear_accel = a - self.gravity_vec
+
+                # Integrate: accel → velocity → displacement
+                self.velocity     += linear_accel * dt
+                self.displacement += self.velocity * dt
+
+        self.pending.clear()
+
+    def get_correction(self):
+        """
+        Returns camera displacement vector to subtract from tvec.
+        Call once per camera frame after add_imu_packet calls.
+        """
+        self._process_pending()
+        if not self.calibrated:
+            return np.zeros(3)
+        return self.displacement.copy()
+
+    def reset_drift(self):
+        """
+        Reset integrator. Call when hammer is known to be stationary
+        (at peak of lift, between blows) to prevent drift accumulation.
+        """
+        self.velocity     = np.zeros(3)
+        self.displacement = np.zeros(3)
+
+    @property
+    def is_ready(self):
+        return self.calibrated
+
+
+
 
 class BlowDetector:
     """
@@ -167,6 +279,7 @@ class BlowDetector:
         self.blow_count               = 0
         self.last_blow_time           = 0
         self.last_blow_height         = None   # hammer height at last impact
+        self.last_set_mm              = None   # set on the most recent blow
         self.prev_height              = None
         self.prev_time                = None
         self.peak_height_since_blow   = None   # tracks highest point since last blow
@@ -221,6 +334,7 @@ class BlowDetector:
             if self.last_blow_height is not None:
                 set_per_blow = (self.last_blow_height - height) * 1000  # mm, positive = penetrated
             self.last_blow_height = height
+            self.last_set_mm      = set_per_blow
 
             set_str = f"set: {set_per_blow:.1f}mm" if set_per_blow is not None else "set: --"
             print(f"BLOW #{self.blow_count:4d} | "
@@ -263,7 +377,9 @@ def main():
         print(f"Press Q to quit, S to save snapshot\n")
 
         q            = device.getOutputQueue("video", maxSize=4, blocking=False)
-        blow_detector = BlowDetector()
+        imu_q        = device.getOutputQueue("imu",   maxSize=50, blocking=False)
+        blow_detector  = BlowDetector()
+        imu_compensator = IMUCompensator()
 
         # CSV logging
         csv_file = open(OUTPUT_CSV, "w", newline="")
@@ -283,6 +399,13 @@ def main():
             timestamp = time.time() - start_time
             frame_count += 1
 
+            # Drain all IMU packets that arrived since last frame
+            while True:
+                imu_pkt = imu_q.tryGet()
+                if imu_pkt is None:
+                    break
+                imu_compensator.add_imu_packet(imu_pkt)
+
             rvec, tvec, inlier_ratio, frame = estimate_pose(
                 frame, camera_matrix, dist_coeffs)
 
@@ -292,11 +415,27 @@ def main():
             height        = None
 
             if tvec is not None:
-                # tvec[1] = vertical axis (camera looking sideways at hammer)
-                # Negate so "up" is positive
+                # Apply IMU camera-shake correction
+                if imu_compensator.is_ready:
+                    correction = imu_compensator.get_correction()
+                    tvec       = tvec.flatten() - correction
+                    tvec       = tvec.reshape(3, 1)
+
+                # tvec[1] = vertical axis, negate so up = positive
                 height = -float(tvec[1])
 
                 velocity, blow, set_per_blow, drop_available = blow_detector.update(timestamp, height)
+
+                # Reset IMU integrator when hammer is moving slowly (at peak of lift)
+                # This prevents drift from accumulating across blows
+                if abs(velocity) < 0.05:
+                    imu_compensator.reset_drift()
+
+                # IMU status
+                imu_status = "IMU OK" if imu_compensator.is_ready else "IMU calibrating..."
+                imu_color  = (0, 255, 0) if imu_compensator.is_ready else (0, 165, 255)
+                cv2.putText(frame, imu_status,
+                            (10, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, imu_color, 2)
 
                 # Overlay
                 cv2.putText(frame, f"Height:   {height:.3f}m",
@@ -309,6 +448,9 @@ def main():
                             (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, drop_color, 2)
                 cv2.putText(frame, f"Blows: {blow_detector.blow_count}",
                             (10, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                last_set_str = f"{blow_detector.last_set_mm:.1f}mm" if blow_detector.last_set_mm is not None else "--"
+                cv2.putText(frame, f"Last set: {last_set_str}",
+                            (10, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
                 writer.writerow([f"{timestamp:.4f}", f"{height:.4f}",
                                  f"{velocity:.4f}", int(blow),
