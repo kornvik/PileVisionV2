@@ -272,22 +272,36 @@ class BlowDetector:
     3. TIME LOCKOUT — MIN_BLOW_INTERVAL_S seconds must have passed
        since last blow. Backup safety net. For drop hammers the
        full cycle (lift + drop) is typically 3-5 seconds anyway.
+
+    Set measurement uses rest-period averaging: after each blow, once the
+    hammer settles (velocity near zero for SETTLE_FRAMES), the height is
+    averaged over REST_AVG_FRAMES to get a precise rest height. Set is the
+    difference between consecutive rest heights.
     """
 
     def __init__(self):
         self.history                  = deque(maxlen=10)
         self.blow_count               = 0
         self.last_blow_time           = 0
-        self.last_blow_height         = None   # hammer height at last impact
         self.last_set_mm              = None   # set on the most recent blow
         self.prev_height              = None
         self.prev_time                = None
         self.peak_height_since_blow   = None   # tracks highest point since last blow
-        self.in_lockout               = False  # True during post-impact shake window
 
         # Tunable — adjust on site
         self.MIN_DROP_HEIGHT   = 0.30   # hammer must rise 30cm before next blow counts
         self.LOCKOUT_SECONDS   = 2.0    # hard time lockout after each blow
+
+        # Rest-period averaging for accurate set measurement
+        self.SETTLE_VELOCITY   = 0.10   # m/s — hammer considered "at rest" below this
+        self.SETTLE_FRAMES     = 10     # consecutive slow frames before averaging starts
+        self.REST_AVG_FRAMES   = 30     # frames to average (~0.5s at 60fps)
+
+        self._settle_count     = 0      # consecutive frames below SETTLE_VELOCITY
+        self._rest_samples     = []     # height samples during rest averaging
+        self._awaiting_rest    = False  # True after blow, waiting to collect rest height
+        self._last_rest_height = None   # averaged rest height from previous blow
+        self._rest_height      = None   # averaged rest height from current blow (for display)
 
     def update(self, timestamp, height):
         velocity = 0.0
@@ -311,6 +325,34 @@ class BlowDetector:
         blow_detected = False
         set_per_blow  = None
 
+        # --- Rest-period averaging state machine ---
+        if self._awaiting_rest:
+            if abs(velocity) < self.SETTLE_VELOCITY:
+                self._settle_count += 1
+            else:
+                self._settle_count = 0
+                self._rest_samples.clear()
+
+            if self._settle_count >= self.SETTLE_FRAMES:
+                self._rest_samples.append(height)
+
+            if len(self._rest_samples) >= self.REST_AVG_FRAMES:
+                rest_h = np.mean(self._rest_samples)
+                self._rest_height = rest_h
+
+                if self._last_rest_height is not None:
+                    set_per_blow = (self._last_rest_height - rest_h) * 1000  # mm
+                    self.last_set_mm = set_per_blow
+                    set_str = f"set: {set_per_blow:.1f}mm"
+                    print(f"  SET #{self.blow_count:4d} | "
+                          f"rest height: {rest_h:.4f}m | "
+                          f"{set_str} (avg of {self.REST_AVG_FRAMES} frames)")
+
+                self._last_rest_height = rest_h
+                self._awaiting_rest = False
+                self._rest_samples.clear()
+                self._settle_count = 0
+
         # How far has hammer risen since last blow?
         drop_available = (
             self.peak_height_since_blow - height
@@ -330,18 +372,14 @@ class BlowDetector:
             blow_detected            = True
             self.peak_height_since_blow = None  # reset — start tracking lift for next blow
 
-            # Set per blow = how much lower than last impact
-            if self.last_blow_height is not None:
-                set_per_blow = (self.last_blow_height - height) * 1000  # mm, positive = penetrated
-            self.last_blow_height = height
-            self.last_set_mm      = set_per_blow
+            # Start rest-period averaging for set measurement
+            self._awaiting_rest = True
+            self._settle_count  = 0
+            self._rest_samples.clear()
 
-            set_str = f"set: {set_per_blow:.1f}mm" if set_per_blow is not None else "set: --"
             print(f"BLOW #{self.blow_count:4d} | "
-                  f"height: {height:.3f}m | "
                   f"velocity: {velocity:.2f}m/s | "
-                  f"drop: {drop_available:.2f}m | "
-                  f"{set_str}")
+                  f"drop: {drop_available:.2f}m")
 
         return velocity, blow_detected, set_per_blow, drop_available
 

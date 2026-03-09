@@ -21,7 +21,7 @@ class TestBlowDetector:
         return d
 
     def simulate_cycle(self, detector, t_start, rest_height, lift_height, impact_height, dt=0.05):
-        """Simulate one full hammer cycle: rest → lift → drop → impact.
+        """Simulate one full hammer cycle: rest → lift → drop → impact → settle.
         Returns list of (velocity, blow, set_mm, drop_avail) tuples."""
         results = []
         t = t_start
@@ -47,6 +47,12 @@ class TestBlowDetector:
         # Impact frame
         results.append(detector.update(t, impact_height))
         t += dt
+
+        # Rest phase: hammer sits at impact_height for rest-period averaging
+        # Need SETTLE_FRAMES (10) + REST_AVG_FRAMES (30) = 40 frames at low velocity
+        for _ in range(50):
+            results.append(detector.update(t, impact_height))
+            t += dt
 
         return results, t
 
@@ -103,24 +109,39 @@ class TestBlowDetector:
         assert d.blow_count == 1
         assert blow is True
 
-    def test_set_per_blow_calculation(self):
-        """Set (penetration) is measured as height difference between successive impacts."""
+    def test_set_per_blow_via_rest_averaging(self):
+        """Set is measured from rest-period height averaging between blows."""
         d = self.make_detector()
+        dt = 1.0 / 60  # 60fps
 
-        # First blow at height 1.0 (past lockout window)
+        # First blow (past lockout)
         d.update(0.0, 1.0)
-        d.update(2.5, 2.0)  # rise, past 2s lockout
-        d.update(3.0, 2.0)  # peak
-        vel, blow, set_mm, _ = d.update(3.05, 1.0)  # fast drop → impact at 1.0m
+        d.update(2.5, 2.0)
+        d.update(3.0, 2.0)
+        _, blow, _, _ = d.update(3.05, 0.5)  # fast drop → blow
         assert blow is True
-        assert set_mm is None  # no previous blow to compare
 
-        # Second blow at height 0.95 (pile penetrated 50mm)
-        d.update(6.0, 1.5)   # rise
-        d.update(6.5, 2.0)   # peak
-        d.update(7.0, 2.0)
-        vel, blow, set_mm, _ = d.update(7.05, 0.95)  # impact at 0.95m
+        # Rest at 1.0m — settle + averaging (10 + 30 = 40 frames)
+        t = 3.1
+        for _ in range(50):
+            d.update(t, 1.0)
+            t += dt
+
+        # Second blow — pile sinks to 0.95m (50mm penetration)
+        d.update(t + 2.5, 2.0)  # rise (past lockout)
+        d.update(t + 3.0, 2.0)  # peak
+        _, blow, _, _ = d.update(t + 3.05, 0.5)  # fast drop → blow
         assert blow is True
+
+        # Rest at 0.95m — this triggers set calculation
+        t2 = t + 3.1
+        set_mm = None
+        for _ in range(50):
+            _, _, s, _ = d.update(t2, 0.95)
+            if s is not None:
+                set_mm = s
+            t2 += dt
+
         assert set_mm is not None
         assert abs(set_mm - 50.0) < 1.0  # ~50mm penetration
 
@@ -189,10 +210,8 @@ class TestBlowDetector:
 
             results, t = self.simulate_cycle(d, t, rest_h, lift_h, impact_h)
 
-            # Wait for lockout between cycles
-            t += 3.0
-            d.update(t, impact_h + 0.01)
-            t += 0.1
+            # Lockout gap between cycles
+            t += 2.5
 
         assert d.blow_count == 5
 
