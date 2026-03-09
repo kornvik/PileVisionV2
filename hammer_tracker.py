@@ -381,7 +381,7 @@ def main():
         blow_detector  = BlowDetector()
         imu_compensator = IMUCompensator()
 
-        # CSV logging
+        # CSV logging — use a reference so we can close in finally
         csv_file = open(OUTPUT_CSV, "w", newline="")
         writer   = csv.writer(csv_file)
         writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
@@ -390,101 +390,104 @@ def main():
         frame_count  = 0
         start_time   = time.time()
 
-        while True:
-            pkt = q.tryGet()
-            if pkt is None:
-                continue
-
-            frame     = pkt.getCvFrame()
-            timestamp = time.time() - start_time
-            frame_count += 1
-
-            # Drain all IMU packets that arrived since last frame
+        try:
             while True:
-                imu_pkt = imu_q.tryGet()
-                if imu_pkt is None:
+                pkt = q.tryGet()
+                if pkt is None:
+                    continue
+
+                frame     = pkt.getCvFrame()
+                timestamp = time.time() - start_time
+                frame_count += 1
+
+                # Drain all IMU packets that arrived since last frame
+                while True:
+                    imu_pkt = imu_q.tryGet()
+                    if imu_pkt is None:
+                        break
+                    imu_compensator.add_imu_packet(imu_pkt)
+
+                rvec, tvec, inlier_ratio, frame = estimate_pose(
+                    frame, camera_matrix, dist_coeffs)
+
+                blow          = False
+                set_per_blow  = None
+                velocity      = 0.0
+                height        = None
+
+                if tvec is not None:
+                    # Apply IMU camera-shake correction
+                    if imu_compensator.is_ready:
+                        correction = imu_compensator.get_correction()
+                        tvec       = tvec.flatten() - correction
+                        tvec       = tvec.reshape(3, 1)
+
+                    # tvec[1] = vertical axis, negate so up = positive
+                    height = -float(tvec[1])
+
+                    velocity, blow, set_per_blow, drop_available = blow_detector.update(timestamp, height)
+
+                    # Reset IMU integrator when hammer is moving slowly (at peak of lift)
+                    # This prevents drift from accumulating across blows
+                    if abs(velocity) < 0.05:
+                        imu_compensator.reset_drift()
+
+                    # IMU status
+                    imu_status = "IMU OK" if imu_compensator.is_ready else "IMU calibrating..."
+                    imu_color  = (0, 255, 0) if imu_compensator.is_ready else (0, 165, 255)
+                    cv2.putText(frame, imu_status,
+                                (10, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, imu_color, 2)
+
+                    # Overlay
+                    cv2.putText(frame, f"Height:   {height:.3f}m",
+                                (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    cv2.putText(frame, f"Velocity: {velocity:+.2f}m/s",
+                                (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    # Drop available — goes green when enough height for a valid blow
+                    drop_color = (0, 255, 0) if drop_available > blow_detector.MIN_DROP_HEIGHT else (100, 100, 100)
+                    cv2.putText(frame, f"Drop avail: {drop_available:.2f}m",
+                                (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, drop_color, 2)
+                    cv2.putText(frame, f"Blows: {blow_detector.blow_count}",
+                                (10, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    last_set_str = f"{blow_detector.last_set_mm:.1f}mm" if blow_detector.last_set_mm is not None else "--"
+                    cv2.putText(frame, f"Last set: {last_set_str}",
+                                (10, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+                    writer.writerow([f"{timestamp:.4f}", f"{height:.4f}",
+                                     f"{velocity:.4f}", int(blow),
+                                     f"{set_per_blow:.1f}" if set_per_blow is not None else "",
+                                     f"{inlier_ratio:.2f}"])
+                    csv_file.flush()
+
+                else:
+                    cv2.putText(frame, "NO DETECTION", (10, 110),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+                # FPS counter
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed if elapsed > 0 else 0
+                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+
+                # Flash on blow
+                if blow:
+                    cv2.rectangle(frame, (0, 0), (CAMERA_WIDTH, CAMERA_HEIGHT),
+                                  (0, 255, 255), 8)
+
+                cv2.imshow("Hammer Tracker", frame)
+                key = cv2.waitKey(1)
+
+                if key == ord('q'):
                     break
-                imu_compensator.add_imu_packet(imu_pkt)
+                elif key == ord('s'):
+                    snap = f"snapshot_{int(timestamp)}.png"
+                    cv2.imwrite(snap, frame)
+                    print(f"Saved {snap}")
 
-            rvec, tvec, inlier_ratio, frame = estimate_pose(
-                frame, camera_matrix, dist_coeffs)
-
-            blow          = False
-            set_per_blow  = None
-            velocity      = 0.0
-            height        = None
-
-            if tvec is not None:
-                # Apply IMU camera-shake correction
-                if imu_compensator.is_ready:
-                    correction = imu_compensator.get_correction()
-                    tvec       = tvec.flatten() - correction
-                    tvec       = tvec.reshape(3, 1)
-
-                # tvec[1] = vertical axis, negate so up = positive
-                height = -float(tvec[1])
-
-                velocity, blow, set_per_blow, drop_available = blow_detector.update(timestamp, height)
-
-                # Reset IMU integrator when hammer is moving slowly (at peak of lift)
-                # This prevents drift from accumulating across blows
-                if abs(velocity) < 0.05:
-                    imu_compensator.reset_drift()
-
-                # IMU status
-                imu_status = "IMU OK" if imu_compensator.is_ready else "IMU calibrating..."
-                imu_color  = (0, 255, 0) if imu_compensator.is_ready else (0, 165, 255)
-                cv2.putText(frame, imu_status,
-                            (10, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, imu_color, 2)
-
-                # Overlay
-                cv2.putText(frame, f"Height:   {height:.3f}m",
-                            (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                cv2.putText(frame, f"Velocity: {velocity:+.2f}m/s",
-                            (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                # Drop available — goes green when enough height for a valid blow
-                drop_color = (0, 255, 0) if drop_available > blow_detector.MIN_DROP_HEIGHT else (100, 100, 100)
-                cv2.putText(frame, f"Drop avail: {drop_available:.2f}m",
-                            (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, drop_color, 2)
-                cv2.putText(frame, f"Blows: {blow_detector.blow_count}",
-                            (10, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                last_set_str = f"{blow_detector.last_set_mm:.1f}mm" if blow_detector.last_set_mm is not None else "--"
-                cv2.putText(frame, f"Last set: {last_set_str}",
-                            (10, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
-                writer.writerow([f"{timestamp:.4f}", f"{height:.4f}",
-                                 f"{velocity:.4f}", int(blow),
-                                 f"{set_per_blow:.1f}" if set_per_blow is not None else "",
-                                 f"{inlier_ratio:.2f}"])
-                csv_file.flush()
-
-            else:
-                cv2.putText(frame, "NO DETECTION", (10, 110),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-            # FPS counter
-            fps = frame_count / (time.time() - start_time)
-            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-
-            # Flash on blow
-            if blow:
-                cv2.rectangle(frame, (0, 0), (CAMERA_WIDTH, CAMERA_HEIGHT),
-                              (0, 255, 255), 8)
-
-            cv2.imshow("Hammer Tracker", frame)
-            key = cv2.waitKey(1)
-
-            if key == ord('q'):
-                break
-            elif key == ord('s'):
-                snap = f"snapshot_{int(timestamp)}.png"
-                cv2.imwrite(snap, frame)
-                print(f"Saved {snap}")
-
-        csv_file.close()
-        cv2.destroyAllWindows()
-        print(f"\nDone. {blow_detector.blow_count} blows logged to {OUTPUT_CSV}")
+        finally:
+            csv_file.close()
+            cv2.destroyAllWindows()
+            print(f"\nDone. {blow_detector.blow_count} blows logged to {OUTPUT_CSV}")
 
 
 if __name__ == "__main__":
