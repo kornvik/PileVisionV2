@@ -239,11 +239,11 @@ class IMUCompensator:
 
     def reset_drift(self):
         """
-        Reset integrator. Call when hammer is known to be stationary
-        (at peak of lift, between blows) to prevent drift accumulation.
+        Reset velocity integrator to prevent drift accumulation.
+        Displacement is kept — it tracks real camera movement from
+        ground settlement during pile driving.
         """
-        self.velocity     = np.zeros(3)
-        self.displacement = np.zeros(3)
+        self.velocity = np.zeros(3)
 
     @property
     def is_ready(self):

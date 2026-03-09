@@ -302,7 +302,7 @@ class TestIMUCompensator:
         assert abs(correction[2]) < 0.001
 
     def test_reset_drift(self):
-        """reset_drift should zero out velocity and displacement."""
+        """reset_drift should zero velocity but keep displacement (ground shift)."""
         comp = IMUCompensator()
         comp.CALIB_COUNT = 5
 
@@ -310,14 +310,16 @@ class TestIMUCompensator:
         comp.add_imu_packet(self.make_imu_packet(calib))
         comp.get_correction()
 
-        # Add some shake
+        # Add some shake to build up velocity + displacement
         shake = [(5.0, -9.81, 0, 0.01 + 0.0025 * i) for i in range(10)]
         comp.add_imu_packet(self.make_imu_packet(shake))
         comp.get_correction()
 
+        disp_before = comp.displacement.copy()
         comp.reset_drift()
         assert np.allclose(comp.velocity, [0, 0, 0])
-        assert np.allclose(comp.displacement, [0, 0, 0])
+        # Displacement preserved — tracks real camera movement
+        assert np.allclose(comp.displacement, disp_before)
 
     def test_bad_timestamps_skipped(self):
         """Samples with dt <= 0 or dt > 0.1 should be skipped."""
