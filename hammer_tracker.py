@@ -19,6 +19,9 @@ import numpy as np
 import time
 import csv
 import argparse
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from collections import deque
 from pathlib import Path
 
@@ -552,12 +555,12 @@ class BlowDetector:
 
         time_since_last = timestamp - self.last_blow_time
 
-        # All three conditions must pass
-        speed_ok   = velocity < -IMPACT_VELOCITY_THRESHOLD
+        # All conditions must pass (speed check disabled for testing)
+        # speed_ok   = velocity < -IMPACT_VELOCITY_THRESHOLD
         drop_ok    = drop_available > self.MIN_DROP_HEIGHT
         lockout_ok = time_since_last > self.LOCKOUT_SECONDS
 
-        if speed_ok and drop_ok and lockout_ok:
+        if drop_ok and lockout_ok:
             self.blow_count         += 1
             self.last_blow_time      = timestamp
             blow_detected            = True
@@ -622,6 +625,31 @@ def draw_summary(frame, lines, y_start=110):
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (10, y_start + i * 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+
+def save_set_plot(blow_detector, session_num):
+    """Save a bar chart of set per blow to PNG."""
+    if not blow_detector or not blow_detector.set_history:
+        return None
+    sets = blow_detector.set_history
+    blows = list(range(1, len(sets) + 1))
+    avg = sum(sets) / len(sets)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(blows, sets, color='steelblue', edgecolor='white')
+    ax.axhline(avg, color='red', linestyle='--', linewidth=1.5, label=f'Avg: {avg:.1f}mm')
+    ax.set_xlabel('Blow #')
+    ax.set_ylabel('Set (mm)')
+    ax.set_title(f'Session {session_num} — Set per Blow')
+    ax.legend()
+    ax.set_xticks(blows)
+    fig.tight_layout()
+
+    filename = f"set_plot_session_{session_num}.png"
+    fig.savefig(filename, dpi=150)
+    plt.close(fig)
+    print(f"Plot saved: {filename}")
+    return filename
 
 
 def mouse_callback(event, x, y, flags, param):
@@ -776,9 +804,10 @@ def run_oakd():
                 # --- Transition: start tracking ---
                 if tracking_active and not was_active:
                     session_num += 1
+                    session_tag = time.strftime("%Y%m%d_%H%M%S")
                     imu_helper = IMUHelper()
                     blow_detector = BlowDetector()
-                    csv_name = f"hammer_log_{session_num}.csv"
+                    csv_name = f"hammer_log_{session_tag}.csv"
                     csv_file = open(csv_name, "w", newline="")
                     writer = csv.writer(csv_file)
                     writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
@@ -789,7 +818,7 @@ def run_oakd():
                 # --- Transition: stop tracking ---
                 if not tracking_active and was_active:
                     summary_lines = build_summary_lines(blow_detector)
-                    csv_name = f"hammer_log_{session_num}.csv"
+                    save_set_plot(blow_detector, session_tag)
                     blows = blow_detector.blow_count if blow_detector else 0
                     if csv_file:
                         csv_file.close()
@@ -878,11 +907,12 @@ def run_realsense():
             # --- Transition: start tracking ---
             if tracking_active and not was_active:
                 session_num += 1
+                session_tag = time.strftime("%Y%m%d_%H%M%S")
                 madgwick = MadgwickFilter(beta=0.1)
                 imu_helper = IMUHelper()
                 imu_helper.CALIB_COUNT = 100
                 blow_detector = BlowDetector()
-                csv_name = f"hammer_log_{session_num}.csv"
+                csv_name = f"hammer_log_{session_tag}.csv"
                 csv_file = open(csv_name, "w", newline="")
                 writer = csv.writer(csv_file)
                 writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
@@ -894,7 +924,7 @@ def run_realsense():
             # --- Transition: stop tracking ---
             if not tracking_active and was_active:
                 summary_lines = build_summary_lines(blow_detector)
-                csv_name = f"hammer_log_{session_num}.csv"
+                save_set_plot(blow_detector, session_tag)
                 blows = blow_detector.blow_count if blow_detector else 0
                 if csv_file:
                     csv_file.close()
