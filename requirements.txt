@@ -1,5 +1,6 @@
 depthai>=2.25.0,<3.0.0
 opencv-contrib-python>=4.8.0
 numpy>=1.24.0
+matplotlib>=3.7.0
 # Optional: for --intel (RealSense D435i) support
 # pyrealsense2>=2.50.0

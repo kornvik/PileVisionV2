@@ -468,7 +468,12 @@ class BlowDetector:
     difference between consecutive rest heights.
     """
 
-    def __init__(self):
+    def __init__(self, set_mode="local_min"):
+        """
+        set_mode: "vel_track" — wait for settle, then average rest height (accurate, needs stillness)
+                  "local_min" — track lowest point after each blow until hammer rises (works with noise)
+        """
+        self.set_mode                 = set_mode
         self.history                  = deque(maxlen=10)
         self.blow_count               = 0
         self.last_blow_time           = 0
@@ -482,7 +487,7 @@ class BlowDetector:
         self.MIN_DROP_HEIGHT   = 0.30   # hammer must rise 30cm before next blow counts
         self.LOCKOUT_SECONDS   = 2.0    # hard time lockout after each blow
 
-        # Rest-period averaging for accurate set measurement
+        # --- vel_track mode ---
         self.SETTLE_VELOCITY   = 0.10   # m/s — hammer considered "at rest" below this
         self.SETTLE_FRAMES     = 10     # consecutive slow frames before averaging starts
         self.REST_AVG_FRAMES   = 30     # frames to average (~0.5s at 60fps)
@@ -492,6 +497,22 @@ class BlowDetector:
         self._awaiting_rest    = False  # True after blow, waiting to collect rest height
         self._last_rest_height = None   # averaged rest height from previous blow
         self._rest_height      = None   # averaged rest height from current blow (for display)
+
+        # --- local_min mode ---
+        self._local_min        = None   # lowest height seen after blow
+        self._rising_count     = 0      # consecutive frames where height > local_min
+        self.RISING_FRAMES     = 5      # frames of rising needed to lock in the local min
+
+    def _record_set(self, rest_h):
+        """Record a set measurement from the given rest height."""
+        if self._last_rest_height is not None:
+            set_per_blow = (self._last_rest_height - rest_h) * 1000  # mm
+            self.last_set_mm = set_per_blow
+            self.set_history.append(set_per_blow)
+            print(f"  SET #{self.blow_count:4d} | "
+                  f"rest height: {rest_h:.4f}m | "
+                  f"set: {set_per_blow:.1f}mm")
+        self._last_rest_height = rest_h
 
     def update(self, timestamp, height, stillness_weight=1.0):
         velocity = 0.0
@@ -514,16 +535,16 @@ class BlowDetector:
 
         blow_detected = False
         set_per_blow  = None
+        prev_set_count = len(self.set_history)
 
-        # --- Rest-period averaging state machine ---
-        if self._awaiting_rest:
+        # --- Set measurement state machine ---
+        if self._awaiting_rest and self.set_mode == "vel_track":
             if abs(velocity) < self.SETTLE_VELOCITY:
                 self._settle_count += 1
             else:
                 self._settle_count = 0
                 self._rest_samples.clear()
 
-            # Weighted averaging: still frames contribute more, noisy less
             if self._settle_count >= self.SETTLE_FRAMES and stillness_weight > 0:
                 self._rest_samples.append((height, stillness_weight))
 
@@ -532,20 +553,31 @@ class BlowDetector:
                 weights = np.array([w for h, w in self._rest_samples])
                 rest_h = np.average(heights, weights=weights)
                 self._rest_height = rest_h
-
-                if self._last_rest_height is not None:
-                    set_per_blow = (self._last_rest_height - rest_h) * 1000  # mm
-                    self.last_set_mm = set_per_blow
-                    self.set_history.append(set_per_blow)
-                    set_str = f"set: {set_per_blow:.1f}mm"
-                    print(f"  SET #{self.blow_count:4d} | "
-                          f"rest height: {rest_h:.4f}m | "
-                          f"{set_str} (avg of {self.REST_AVG_FRAMES} frames)")
-
-                self._last_rest_height = rest_h
+                self._record_set(rest_h)
                 self._awaiting_rest = False
                 self._rest_samples.clear()
                 self._settle_count = 0
+
+        if self._awaiting_rest and self.set_mode == "local_min":
+            if self._local_min is None or height < self._local_min:
+                self._local_min = height
+                self._rising_count = 0
+            elif height > self._local_min + 0.005:  # 5mm hysteresis
+                self._rising_count += 1
+            else:
+                self._rising_count = 0
+
+            if self._rising_count >= self.RISING_FRAMES:
+                rest_h = self._local_min
+                self._rest_height = rest_h
+                self._record_set(rest_h)
+                self._awaiting_rest = False
+                self._local_min = None
+                self._rising_count = 0
+
+        # Check if a new set was just recorded
+        if len(self.set_history) > prev_set_count:
+            set_per_blow = self.set_history[-1]
 
         # How far has hammer risen since last blow?
         drop_available = (
@@ -566,10 +598,12 @@ class BlowDetector:
             blow_detected            = True
             self.peak_height_since_blow = None  # reset — start tracking lift for next blow
 
-            # Start rest-period averaging for set measurement
+            # Start set measurement for next rest period
             self._awaiting_rest = True
             self._settle_count  = 0
             self._rest_samples.clear()
+            self._local_min     = None
+            self._rising_count  = 0
 
             print(f"BLOW #{self.blow_count:4d} | "
                   f"velocity: {velocity:.2f}m/s | "
