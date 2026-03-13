@@ -341,7 +341,7 @@ class IMUHelper:
                 rv = imu_data.rotationVector
                 pitch = self._quat_to_pitch(rv.i, rv.j, rv.k, rv.real)
 
-                la = imu_data.linearAcceleration
+                la = imu_data.acceleroMeter
                 accel_mag = float(np.sqrt(la.x**2 + la.y**2 + la.z**2))
 
                 timestamp = None
@@ -749,7 +749,7 @@ def run_oakd():
         q = device.getOutputQueue("video", maxSize=4, blocking=False)
         imu_q = device.getOutputQueue("imu", maxSize=50, blocking=False)
 
-        cv2.namedWindow("Hammer Tracker")
+        cv2.namedWindow("Hammer Tracker", cv2.WINDOW_NORMAL)
         cv2.setMouseCallback("Hammer Tracker", mouse_callback)
 
         tracking_active = False
@@ -855,7 +855,7 @@ def run_realsense():
     print(f"Camera matrix loaded from RealSense calibration")
     print(f"Click START to begin tracking, Q to quit\n")
 
-    cv2.namedWindow("Hammer Tracker")
+    cv2.namedWindow("Hammer Tracker", cv2.WINDOW_NORMAL)
     cv2.setMouseCallback("Hammer Tracker", mouse_callback)
 
     tracking_active = False
