@@ -5,7 +5,10 @@ import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
 from collections import namedtuple
 
-from hammer_tracker import BlowDetector, IMUHelper, MadgwickFilter, estimate_pose, IMPACT_VELOCITY_THRESHOLD
+from hammer_tracker import (
+    BlowDetector, IMUHelper, MadgwickFilter, estimate_pose, process_frame,
+    IMPACT_VELOCITY_THRESHOLD, CAMERA_WIDTH, CAMERA_HEIGHT,
+)
 
 
 # ============================================================
@@ -324,9 +327,9 @@ class TestIMUHelper:
             imu_data.rotationVector.j = qj
             imu_data.rotationVector.k = qk
             imu_data.rotationVector.real = qr
-            imu_data.linearAcceleration.x = lax
-            imu_data.linearAcceleration.y = lay
-            imu_data.linearAcceleration.z = laz
+            imu_data.acceleroMeter.x = lax
+            imu_data.acceleroMeter.y = lay
+            imu_data.acceleroMeter.z = laz
             imu_datas.append(imu_data)
         packet.packets = imu_datas
         return packet
@@ -517,12 +520,12 @@ class TestIMUHelper:
             imu_data.rotationVector.j = qj
             imu_data.rotationVector.k = qk
             imu_data.rotationVector.real = qr
-            imu_data.linearAcceleration.x = lax
-            imu_data.linearAcceleration.y = lay
-            imu_data.linearAcceleration.z = laz
+            imu_data.acceleroMeter.x = lax
+            imu_data.acceleroMeter.y = lay
+            imu_data.acceleroMeter.z = laz
             td = MagicMock()
             td.total_seconds.return_value = ts
-            imu_data.linearAcceleration.getTimestampDevice.return_value = td
+            imu_data.acceleroMeter.getTimestampDevice.return_value = td
             imu_datas.append(imu_data)
         packet.packets = imu_datas
         return packet
@@ -853,3 +856,118 @@ class TestMadgwickFilter:
 
         assert h.is_ready is True
         assert abs(h.baseline_pitch) < 0.05
+
+
+# ============================================================
+# process_frame Tests
+# ============================================================
+
+class TestProcessFrame:
+    """Test process_frame with real (3,1) shaped tvec from solvePnPRansac."""
+
+    def _make_helpers(self):
+        """Create calibrated IMUHelper + BlowDetector."""
+        imu = IMUHelper()
+        imu.CALIB_COUNT = 5
+        for _ in range(5):
+            imu.process_sample(0.0, 0.0, 0.0)
+        assert imu.is_ready
+        return imu, BlowDetector()
+
+    def _mock_estimate_pose(self, tvec_vals, inlier_ratio=0.85):
+        """Return a mock estimate_pose that yields a (3,1) tvec."""
+        rvec = np.array([[0.0], [0.0], [0.0]])
+        tvec = np.array(tvec_vals).reshape(3, 1)
+
+        def fake_estimate(frame, cam, dist):
+            return rvec, tvec, inlier_ratio, frame
+        return fake_estimate
+
+    def test_with_3x1_tvec(self):
+        """process_frame works with realistic (3,1) shaped tvec."""
+        imu, bd = self._make_helpers()
+        frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+        cam = np.eye(3) * 500; cam[2, 2] = 1
+        dist = np.zeros(5)
+        csv_mock = MagicMock()
+        writer_mock = MagicMock()
+
+        with patch('hammer_tracker.estimate_pose',
+                   self._mock_estimate_pose([0.0, -1.5, 3.0])), \
+             patch('cv2.putText'), \
+             patch('cv2.rectangle'):
+            out_frame, blow = process_frame(
+                frame, 1.0, cam, dist, imu, bd,
+                writer_mock, csv_mock, 1, 0.0)
+
+        assert out_frame is not None
+        assert blow is False
+        writer_mock.writerow.assert_called_once()
+
+    def test_no_detection(self):
+        """process_frame handles None tvec (no board detected)."""
+        imu, bd = self._make_helpers()
+        frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+        cam = np.eye(3) * 500; cam[2, 2] = 1
+        dist = np.zeros(5)
+        csv_mock = MagicMock()
+        writer_mock = MagicMock()
+
+        def no_detect(frame, cam, dist):
+            return None, None, 0, frame
+
+        with patch('hammer_tracker.estimate_pose', no_detect), \
+             patch('cv2.putText'):
+            out_frame, blow = process_frame(
+                frame, 1.0, cam, dist, imu, bd,
+                writer_mock, csv_mock, 1, 0.0)
+
+        assert blow is False
+        writer_mock.writerow.assert_not_called()
+
+    def test_csv_row_written_on_detection(self):
+        """CSV row is written with correct number of fields when board detected."""
+        imu, bd = self._make_helpers()
+        frame = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+        cam = np.eye(3) * 500; cam[2, 2] = 1
+        dist = np.zeros(5)
+        csv_mock = MagicMock()
+        writer_mock = MagicMock()
+
+        with patch('hammer_tracker.estimate_pose',
+                   self._mock_estimate_pose([0.1, -2.0, 4.0])), \
+             patch('cv2.putText'), \
+             patch('cv2.rectangle'):
+            process_frame(frame, 2.0, cam, dist, imu, bd,
+                          writer_mock, csv_mock, 1, 0.0)
+
+        row = writer_mock.writerow.call_args[0][0]
+        assert len(row) == 6  # timestamp, height, velocity, blow, set_mm, inlier
+
+    def test_sequential_frames_compute_velocity(self):
+        """Two consecutive frames produce non-zero velocity."""
+        imu, bd = self._make_helpers()
+        cam = np.eye(3) * 500; cam[2, 2] = 1
+        dist = np.zeros(5)
+        csv_mock = MagicMock()
+        writer_mock = MagicMock()
+
+        with patch('cv2.putText'), patch('cv2.rectangle'):
+            # Frame 1: height derived from tvec_y = -1.0 → height ~1.0
+            with patch('hammer_tracker.estimate_pose',
+                       self._mock_estimate_pose([0.0, -1.0, 3.0])):
+                f1 = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+                process_frame(f1, 1.0, cam, dist, imu, bd,
+                              writer_mock, csv_mock, 1, 0.0)
+
+            # Frame 2: height derived from tvec_y = -2.0 → height ~2.0
+            with patch('hammer_tracker.estimate_pose',
+                       self._mock_estimate_pose([0.0, -2.0, 3.0])):
+                f2 = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+                process_frame(f2, 2.0, cam, dist, imu, bd,
+                              writer_mock, csv_mock, 2, 0.0)
+
+        # Second call should have written a velocity != 0
+        row = writer_mock.writerow.call_args_list[1][0][0]
+        velocity = float(row[2])
+        assert velocity != 0.0
