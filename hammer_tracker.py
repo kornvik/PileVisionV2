@@ -470,6 +470,7 @@ class BlowDetector:
         self.blow_count               = 0
         self.last_blow_time           = 0
         self.last_set_mm              = None   # set on the most recent blow
+        self.set_history              = []     # all set measurements (mm)
         self.prev_height              = None
         self.prev_time                = None
         self.peak_height_since_blow   = None   # tracks highest point since last blow
@@ -532,6 +533,7 @@ class BlowDetector:
                 if self._last_rest_height is not None:
                     set_per_blow = (self._last_rest_height - rest_h) * 1000  # mm
                     self.last_set_mm = set_per_blow
+                    self.set_history.append(set_per_blow)
                     set_str = f"set: {set_per_blow:.1f}mm"
                     print(f"  SET #{self.blow_count:4d} | "
                           f"rest height: {rest_h:.4f}m | "
@@ -571,6 +573,65 @@ class BlowDetector:
                   f"drop: {drop_available:.2f}m")
 
         return velocity, blow_detected, set_per_blow, drop_available
+
+
+# ============================================================
+# UI — START/STOP BUTTON
+# ============================================================
+
+# Button rect (x1, y1, x2, y2) — computed once, used for drawing + hit-test
+_BTN_W, _BTN_H = 160, 50
+_BTN_RECT = (
+    CAMERA_WIDTH // 2 - _BTN_W // 2,
+    CAMERA_HEIGHT - 70,
+    CAMERA_WIDTH // 2 + _BTN_W // 2,
+    CAMERA_HEIGHT - 70 + _BTN_H,
+)
+
+tracking_active = False
+
+
+def draw_button(frame, active):
+    """Draw START/STOP button on frame."""
+    x1, y1, x2, y2 = _BTN_RECT
+    color = (0, 0, 200) if active else (0, 180, 0)
+    label = "STOP" if active else "START"
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, -1)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
+    tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0][0]
+    cv2.putText(frame, label, (x1 + (_BTN_W - tw) // 2, y2 - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+
+def build_summary_lines(blow_detector):
+    """Build summary text lines from a completed session's blow detector."""
+    lines = []
+    if not blow_detector:
+        return lines
+    lines.append(f"Total blows: {blow_detector.blow_count}")
+    if blow_detector.set_history:
+        for i, s in enumerate(blow_detector.set_history, 1):
+            lines.append(f"  #{i}: {s:.1f}mm")
+        avg = sum(blow_detector.set_history) / len(blow_detector.set_history)
+        lines.append(f"  Avg set: {avg:.1f}mm")
+    return lines
+
+
+def draw_summary(frame, lines, y_start=110):
+    """Draw summary lines on frame."""
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (10, y_start + i * 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+
+def mouse_callback(event, x, y, flags, param):
+    """Toggle tracking_active when user clicks the button."""
+    global tracking_active
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    bx1, by1, bx2, by2 = _BTN_RECT
+    if bx1 <= x <= bx2 and by1 <= y <= by2:
+        tracking_active = not tracking_active
 
 
 # ============================================================
@@ -660,6 +721,7 @@ def process_frame(frame, timestamp, camera_matrix, dist_coeffs,
 # ============================================================
 
 def run_oakd():
+    global tracking_active
     import depthai as dai
 
     pipeline = build_pipeline()
@@ -682,20 +744,24 @@ def run_oakd():
 
         print(f"Camera matrix loaded from device calibration")
         print(f"Starting at {CAMERA_FPS}fps, exposure {EXPOSURE_US}µs")
-        print(f"Press Q to quit, S to save snapshot\n")
+        print(f"Click START to begin tracking, Q to quit\n")
 
         q = device.getOutputQueue("video", maxSize=4, blocking=False)
         imu_q = device.getOutputQueue("imu", maxSize=50, blocking=False)
-        blow_detector = BlowDetector()
-        imu_helper = IMUHelper()
 
-        csv_file = open(OUTPUT_CSV, "w", newline="")
-        writer = csv.writer(csv_file)
-        writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
-                         "blow", "set_mm", "inlier_ratio"])
+        cv2.namedWindow("Hammer Tracker")
+        cv2.setMouseCallback("Hammer Tracker", mouse_callback)
 
+        tracking_active = False
+        was_active = False
+        blow_detector = None
+        imu_helper = None
+        csv_file = None
+        writer = None
+        session_num = 0
         frame_count = 0
         start_time = time.time()
+        summary_lines = []
 
         try:
             while True:
@@ -707,18 +773,55 @@ def run_oakd():
                 timestamp = time.time() - start_time
                 frame_count += 1
 
-                # Drain all IMU packets that arrived since last frame
-                while True:
-                    imu_pkt = imu_q.tryGet()
-                    if imu_pkt is None:
-                        break
-                    imu_helper.add_imu_packet(imu_pkt)
+                # --- Transition: start tracking ---
+                if tracking_active and not was_active:
+                    session_num += 1
+                    imu_helper = IMUHelper()
+                    blow_detector = BlowDetector()
+                    csv_name = f"hammer_log_{session_num}.csv"
+                    csv_file = open(csv_name, "w", newline="")
+                    writer = csv.writer(csv_file)
+                    writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
+                                     "blow", "set_mm", "inlier_ratio"])
+                    summary_lines = []
+                    print(f"\n--- Session {session_num} started → {csv_name} ---")
 
-                frame, blow = process_frame(
-                    frame, timestamp, camera_matrix, dist_coeffs,
-                    imu_helper, blow_detector, writer, csv_file,
-                    frame_count, start_time)
+                # --- Transition: stop tracking ---
+                if not tracking_active and was_active:
+                    summary_lines = build_summary_lines(blow_detector)
+                    csv_name = f"hammer_log_{session_num}.csv"
+                    blows = blow_detector.blow_count if blow_detector else 0
+                    if csv_file:
+                        csv_file.close()
+                        csv_file = None
+                    print(f"--- Session {session_num} stopped. {blows} blows → {csv_name} ---\n")
+                    blow_detector = None
+                    imu_helper = None
 
+                was_active = tracking_active
+
+                if tracking_active:
+                    # Drain IMU packets
+                    while True:
+                        imu_pkt = imu_q.tryGet()
+                        if imu_pkt is None:
+                            break
+                        imu_helper.add_imu_packet(imu_pkt)
+
+                    frame, blow = process_frame(
+                        frame, timestamp, camera_matrix, dist_coeffs,
+                        imu_helper, blow_detector, writer, csv_file,
+                        frame_count, start_time)
+                else:
+                    # Preview only — show ChArUco overlay but no tracking
+                    _, _, _, frame = estimate_pose(frame, camera_matrix, dist_coeffs)
+                    # Drain and discard IMU packets to avoid queue buildup
+                    while imu_q.tryGet() is not None:
+                        pass
+                    if summary_lines:
+                        draw_summary(frame, summary_lines)
+
+                draw_button(frame, tracking_active)
                 cv2.imshow("Hammer Tracker", frame)
                 key = cv2.waitKey(1)
 
@@ -730,9 +833,11 @@ def run_oakd():
                     print(f"Saved {snap}")
 
         finally:
-            csv_file.close()
+            if csv_file:
+                csv_file.close()
             cv2.destroyAllWindows()
-            print(f"\nDone. {blow_detector.blow_count} blows logged to {OUTPUT_CSV}")
+            if blow_detector:
+                print(f"\nDone. {blow_detector.blow_count} blows logged")
 
 
 # ============================================================
@@ -740,6 +845,7 @@ def run_oakd():
 # ============================================================
 
 def run_realsense():
+    global tracking_active
     import pyrealsense2 as rs
 
     print("Connecting to RealSense D435i...")
@@ -747,48 +853,82 @@ def run_realsense():
     camera_matrix, dist_coeffs = get_realsense_intrinsics(profile)
 
     print(f"Camera matrix loaded from RealSense calibration")
-    print(f"Press Q to quit, S to save snapshot\n")
+    print(f"Click START to begin tracking, Q to quit\n")
 
-    madgwick = MadgwickFilter(beta=0.1)
-    imu_helper = IMUHelper()
-    imu_helper.CALIB_COUNT = 100  # ~1.5s at 63Hz accel rate
-    blow_detector = BlowDetector()
+    cv2.namedWindow("Hammer Tracker")
+    cv2.setMouseCallback("Hammer Tracker", mouse_callback)
 
-    csv_file = open(OUTPUT_CSV, "w", newline="")
-    writer = csv.writer(csv_file)
-    writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
-                     "blow", "set_mm", "inlier_ratio"])
-
+    tracking_active = False
+    was_active = False
+    madgwick = None
+    imu_helper = None
+    blow_detector = None
+    csv_file = None
+    writer = None
+    session_num = 0
     frame_count = 0
     start_time = time.time()
     last_gyro_ts = None
+    summary_lines = []
 
     try:
         while True:
             frames = pipe.wait_for_frames()
 
-            # Process IMU (accel + gyro → Madgwick → pitch + linear accel)
-            accel_frame = frames.first_or_default(rs.stream.accel)
-            gyro_frame = frames.first_or_default(rs.stream.gyro)
+            # --- Transition: start tracking ---
+            if tracking_active and not was_active:
+                session_num += 1
+                madgwick = MadgwickFilter(beta=0.1)
+                imu_helper = IMUHelper()
+                imu_helper.CALIB_COUNT = 100
+                blow_detector = BlowDetector()
+                csv_name = f"hammer_log_{session_num}.csv"
+                csv_file = open(csv_name, "w", newline="")
+                writer = csv.writer(csv_file)
+                writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
+                                 "blow", "set_mm", "inlier_ratio"])
+                last_gyro_ts = None
+                summary_lines = []
+                print(f"\n--- Session {session_num} started → {csv_name} ---")
 
-            if accel_frame and gyro_frame:
-                ad = accel_frame.as_motion_frame().get_motion_data()
-                gd = gyro_frame.as_motion_frame().get_motion_data()
+            # --- Transition: stop tracking ---
+            if not tracking_active and was_active:
+                summary_lines = build_summary_lines(blow_detector)
+                csv_name = f"hammer_log_{session_num}.csv"
+                blows = blow_detector.blow_count if blow_detector else 0
+                if csv_file:
+                    csv_file.close()
+                    csv_file = None
+                print(f"--- Session {session_num} stopped. {blows} blows → {csv_name} ---\n")
+                blow_detector = None
+                imu_helper = None
+                madgwick = None
 
-                accel = np.array([ad.x, ad.y, ad.z])
-                gyro = np.array([gd.x, gd.y, gd.z])
+            was_active = tracking_active
 
-                t_now = gyro_frame.get_timestamp() / 1000.0  # ms → s
-                dt = (t_now - last_gyro_ts) if last_gyro_ts is not None else 0.005
-                last_gyro_ts = t_now
+            # Process IMU when tracking
+            if tracking_active:
+                accel_frame = frames.first_or_default(rs.stream.accel)
+                gyro_frame = frames.first_or_default(rs.stream.gyro)
 
-                if 0 < dt < 0.1:
-                    madgwick.update(gyro, accel, dt)
+                if accel_frame and gyro_frame:
+                    ad = accel_frame.as_motion_frame().get_motion_data()
+                    gd = gyro_frame.as_motion_frame().get_motion_data()
 
-                pitch = madgwick.get_pitch()
-                lin_accel = madgwick.remove_gravity(accel)
-                lin_mag = float(np.linalg.norm(lin_accel))
-                imu_helper.process_sample(pitch, lin_mag, lin_accel[1], t_now)
+                    accel = np.array([ad.x, ad.y, ad.z])
+                    gyro = np.array([gd.x, gd.y, gd.z])
+
+                    t_now = gyro_frame.get_timestamp() / 1000.0
+                    dt = (t_now - last_gyro_ts) if last_gyro_ts is not None else 0.005
+                    last_gyro_ts = t_now
+
+                    if 0 < dt < 0.1:
+                        madgwick.update(gyro, accel, dt)
+
+                    pitch = madgwick.get_pitch()
+                    lin_accel = madgwick.remove_gravity(accel)
+                    lin_mag = float(np.linalg.norm(lin_accel))
+                    imu_helper.process_sample(pitch, lin_mag, lin_accel[1], t_now)
 
             # Get color frame
             color_frame = frames.get_color_frame()
@@ -799,11 +939,17 @@ def run_realsense():
             timestamp = time.time() - start_time
             frame_count += 1
 
-            frame, blow = process_frame(
-                frame, timestamp, camera_matrix, dist_coeffs,
-                imu_helper, blow_detector, writer, csv_file,
-                frame_count, start_time)
+            if tracking_active:
+                frame, blow = process_frame(
+                    frame, timestamp, camera_matrix, dist_coeffs,
+                    imu_helper, blow_detector, writer, csv_file,
+                    frame_count, start_time)
+            else:
+                _, _, _, frame = estimate_pose(frame, camera_matrix, dist_coeffs)
+                if summary_lines:
+                    draw_summary(frame, summary_lines)
 
+            draw_button(frame, tracking_active)
             cv2.imshow("Hammer Tracker", frame)
             key = cv2.waitKey(1)
 
@@ -816,9 +962,11 @@ def run_realsense():
 
     finally:
         pipe.stop()
-        csv_file.close()
+        if csv_file:
+            csv_file.close()
         cv2.destroyAllWindows()
-        print(f"\nDone. {blow_detector.blow_count} blows logged to {OUTPUT_CSV}")
+        if blow_detector:
+            print(f"\nDone. {blow_detector.blow_count} blows logged")
 
 
 # ============================================================
