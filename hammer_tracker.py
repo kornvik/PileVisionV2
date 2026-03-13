@@ -651,7 +651,7 @@ def process_frame(frame, timestamp, camera_matrix, dist_coeffs,
     if tvec is not None:
         tilt_corr = imu_helper.get_tilt_correction(tvec)
         disp_corr = imu_helper.get_displacement_y()
-        height = -float(tvec[1]) + tilt_corr - disp_corr
+        height = -float(tvec.flatten()[1]) + tilt_corr - disp_corr
 
         weight = imu_helper.get_stillness_weight()
         velocity, blow, set_per_blow, drop_available = blow_detector.update(
