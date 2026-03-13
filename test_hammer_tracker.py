@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
 from collections import namedtuple
 
-from hammer_tracker import BlowDetector, IMUHelper, estimate_pose, IMPACT_VELOCITY_THRESHOLD
+from hammer_tracker import BlowDetector, IMUHelper, MadgwickFilter, estimate_pose, IMPACT_VELOCITY_THRESHOLD
 
 
 # ============================================================
@@ -768,3 +768,88 @@ class TestEstimatePose:
             _, _, ratio, _ = estimate_pose(frame, cam_matrix, dist)
 
         assert ratio == pytest.approx(0.7, abs=0.01)
+
+
+# ============================================================
+# MadgwickFilter Tests
+# ============================================================
+
+class TestMadgwickFilter:
+
+    def test_initial_quaternion_is_identity(self):
+        m = MadgwickFilter()
+        np.testing.assert_array_almost_equal(m.q, [1, 0, 0, 0])
+
+    def test_converges_to_gravity_when_stationary(self):
+        """With zero gyro and accel = [0, 0, 9.81], pitch should stay ~0."""
+        m = MadgwickFilter(beta=0.1)
+        accel = np.array([0.0, 0.0, 9.81])
+        gyro = np.array([0.0, 0.0, 0.0])
+        for _ in range(500):
+            m.update(gyro, accel, 0.005)
+        assert abs(m.get_pitch()) < 0.02  # near zero pitch
+
+    def test_pitch_from_tilted_accel(self):
+        """Accel tilted ~30deg around X → pitch converges near 30deg."""
+        m = MadgwickFilter(beta=0.5)  # high beta for fast convergence
+        pitch_rad = np.radians(30)
+        # Gravity rotated by pitch around X axis
+        accel = np.array([0.0, 9.81 * np.sin(pitch_rad), 9.81 * np.cos(pitch_rad)])
+        gyro = np.array([0.0, 0.0, 0.0])
+        for _ in range(1000):
+            m.update(gyro, accel, 0.005)
+        assert abs(m.get_pitch() - pitch_rad) < 0.05
+
+    def test_remove_gravity_when_stationary(self):
+        """Stationary sensor: remove_gravity should yield ~zero."""
+        m = MadgwickFilter(beta=0.5)
+        accel = np.array([0.0, 0.0, 9.81])
+        gyro = np.array([0.0, 0.0, 0.0])
+        for _ in range(500):
+            m.update(gyro, accel, 0.005)
+        lin = m.remove_gravity(accel)
+        assert np.linalg.norm(lin) < 0.1  # near zero
+
+    def test_remove_gravity_with_motion(self):
+        """Stationary filter + extra 2m/s^2 on X → linear accel ~2 on X."""
+        m = MadgwickFilter(beta=0.5)
+        accel_still = np.array([0.0, 0.0, 9.81])
+        gyro = np.array([0.0, 0.0, 0.0])
+        for _ in range(500):
+            m.update(gyro, accel_still, 0.005)
+        accel_moving = np.array([2.0, 0.0, 9.81])
+        lin = m.remove_gravity(accel_moving)
+        assert abs(lin[0] - 2.0) < 0.2
+        assert abs(lin[2]) < 0.2
+
+    def test_gravity_vector_magnitude(self):
+        """Gravity vector should have magnitude ~9.81."""
+        m = MadgwickFilter()
+        g = m.get_gravity_vector()
+        assert abs(np.linalg.norm(g) - 9.81) < 0.01
+
+    def test_zero_dt_is_noop(self):
+        """dt=0 should not change state."""
+        m = MadgwickFilter()
+        q_before = m.q.copy()
+        m.update(np.zeros(3), np.array([0, 0, 9.81]), 0.0)
+        np.testing.assert_array_equal(m.q, q_before)
+
+    def test_process_sample_integration(self):
+        """MadgwickFilter output feeds IMUHelper.process_sample correctly."""
+        m = MadgwickFilter(beta=0.5)
+        h = IMUHelper()
+        h.CALIB_COUNT = 5
+
+        accel = np.array([0.0, 0.0, 9.81])
+        gyro = np.array([0.0, 0.0, 0.0])
+
+        for i in range(10):
+            m.update(gyro, accel, 0.005)
+            pitch = m.get_pitch()
+            lin = m.remove_gravity(accel)
+            lin_mag = float(np.linalg.norm(lin))
+            h.process_sample(pitch, lin_mag, lin[1], 0.01 + i * 0.005)
+
+        assert h.is_ready is True
+        assert abs(h.baseline_pitch) < 0.05

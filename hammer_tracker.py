@@ -14,11 +14,11 @@ Output:
   - Console blow count + set per blow
 """
 
-import depthai as dai
 import cv2
 import numpy as np
 import time
 import csv
+import argparse
 from collections import deque
 from pathlib import Path
 
@@ -78,6 +78,7 @@ charuco_detector = cv2.aruco.CharucoDetector(board, charuco_params, detector_par
 # ============================================================
 
 def build_pipeline():
+    import depthai as dai
     pipeline = dai.Pipeline()
 
     cam = pipeline.create(dai.node.ColorCamera)
@@ -86,7 +87,7 @@ def build_pipeline():
     cam.setInterleaved(False)
 
     # Manual exposure to freeze motion blur
-    cam.initialControl.setManualExposure(EXPOSURE_US, ISO)
+    # cam.initialControl.setManualExposure(EXPOSURE_US, ISO)
 
     xout = pipeline.create(dai.node.XLinkOut)
     xout.setStreamName("video")
@@ -109,12 +110,43 @@ def build_pipeline():
 
 
 # ============================================================
+# REALSENSE PIPELINE (D435i)
+# ============================================================
+
+def build_realsense_pipeline():
+    """Start RealSense D435i: color 1920x1080@30fps + accel + gyro."""
+    import pyrealsense2 as rs
+    pipe = rs.pipeline()
+    cfg = rs.config()
+    cfg.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 30)
+    cfg.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 63)
+    cfg.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
+    profile = pipe.start(cfg)
+    return pipe, profile
+
+
+def get_realsense_intrinsics(profile):
+    """Extract camera_matrix and dist_coeffs from RealSense calibration."""
+    import pyrealsense2 as rs
+    stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+    intr = stream.get_intrinsics()
+    camera_matrix = np.array([
+        [intr.fx, 0, intr.ppx],
+        [0, intr.fy, intr.ppy],
+        [0, 0, 1]
+    ])
+    dist_coeffs = np.array(intr.coeffs)
+    return camera_matrix, dist_coeffs
+
+
+# ============================================================
 # POSE ESTIMATION
 # ============================================================
 
 def estimate_pose(frame, camera_matrix, dist_coeffs):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = charuco_detector.detectBoard(gray)
+    result = charuco_detector.detectBoard(gray)
+    corners, ids = result[0], result[1]
 
     if ids is None or len(ids) < 4:
         return None, None, 0, frame
@@ -150,6 +182,72 @@ def estimate_pose(frame, camera_matrix, dist_coeffs):
 
 
 # ============================================================
+# MADGWICK AHRS FILTER (for RealSense raw IMU)
+# ============================================================
+
+class MadgwickFilter:
+    """Fuses raw accel + gyro into orientation quaternion (Madgwick AHRS)."""
+
+    def __init__(self, beta=0.1):
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])  # [w, x, y, z]
+        self.beta = beta
+
+    def update(self, gyro, accel, dt):
+        if dt <= 0:
+            return
+        q0, q1, q2, q3 = self.q
+        gx, gy, gz = gyro
+        a_norm = np.linalg.norm(accel)
+        if a_norm < 1e-6:
+            return
+        ax, ay, az = accel / a_norm
+        # Gradient descent corrective step
+        f = np.array([
+            2 * (q1 * q3 - q0 * q2) - ax,
+            2 * (q0 * q1 + q2 * q3) - ay,
+            2 * (0.5 - q1 * q1 - q2 * q2) - az
+        ])
+        J = np.array([
+            [-2 * q2,  2 * q3, -2 * q0,  2 * q1],
+            [ 2 * q1,  2 * q0,  2 * q3,  2 * q2],
+            [      0, -4 * q1, -4 * q2,       0]
+        ])
+        step = J.T @ f
+        step_norm = np.linalg.norm(step)
+        if step_norm > 1e-6:
+            step /= step_norm
+        # Quaternion rate from gyroscope
+        q_dot = 0.5 * np.array([
+            -q1 * gx - q2 * gy - q3 * gz,
+             q0 * gx + q2 * gz - q3 * gy,
+             q0 * gy - q1 * gz + q3 * gx,
+             q0 * gz + q1 * gy - q2 * gx
+        ])
+        q_dot -= self.beta * step
+        self.q += q_dot * dt
+        self.q /= np.linalg.norm(self.q)
+
+    def get_pitch(self):
+        """Extract pitch from quaternion [w, x, y, z]."""
+        w, x, y, z = self.q
+        sinp = 2.0 * (w * x + y * z)
+        return float(np.arcsin(np.clip(sinp, -1.0, 1.0)))
+
+    def get_gravity_vector(self):
+        """Gravity vector in sensor frame (m/s^2)."""
+        w, x, y, z = self.q
+        return np.array([
+            2 * (x * z - w * y),
+            2 * (w * x + y * z),
+            w * w - x * x - y * y + z * z
+        ]) * 9.81
+
+    def remove_gravity(self, accel):
+        """Return linear acceleration with gravity subtracted."""
+        return accel - self.get_gravity_vector()
+
+
+# ============================================================
 # IMU COMPENSATOR
 # ============================================================
 
@@ -177,7 +275,7 @@ class IMUHelper:
 
     def __init__(self):
         self.calibrated       = False
-        self.calib_quats      = []
+        self.calib_pitches    = []
         self.CALIB_COUNT      = 200    # ~0.5s at 400Hz
 
         # Baseline pitch from calibration (radians)
@@ -210,42 +308,47 @@ class IMUHelper:
         return float(np.arcsin(sinp))
 
     def add_imu_packet(self, packet):
-        """Called for every IMU packet received from the device."""
+        """Called for every OAK-D IMU packet received from the device."""
         self.pending.append(packet)
 
+    def process_sample(self, pitch, linear_accel_mag, accel_y, timestamp=None):
+        """Process a single IMU sample (works for both OAK-D and RealSense)."""
+        self.pitch = pitch
+        self.linear_accel_mag = linear_accel_mag
+
+        if not self.calibrated:
+            self.calib_pitches.append(pitch)
+            if len(self.calib_pitches) >= self.CALIB_COUNT:
+                self.baseline_pitch = float(np.mean(self.calib_pitches))
+                self.calibrated = True
+                print(f"IMU calibrated. Baseline pitch: "
+                      f"{np.degrees(self.baseline_pitch):.2f}°")
+            return
+
+        # ZUPT: buffer accel samples when active
+        if self._zupt_active and timestamp is not None:
+            if self._prev_time is not None:
+                dt = timestamp - self._prev_time
+                if 0 < dt < 0.1:
+                    self._zupt_accel_y.append(accel_y)
+                    self._zupt_dt.append(dt)
+            self._prev_time = timestamp
+
     def _process_pending(self):
-        """Process all pending IMU packets."""
+        """Process all pending OAK-D IMU packets."""
         for packet in self.pending:
             for imu_data in packet.packets:
-                # Rotation vector → quaternion (i, j, k, real)
                 rv = imu_data.rotationVector
-                self.pitch = self._quat_to_pitch(rv.i, rv.j, rv.k, rv.real)
+                pitch = self._quat_to_pitch(rv.i, rv.j, rv.k, rv.real)
 
-                # Linear acceleration (gravity already removed by BNO085)
                 la = imu_data.linearAcceleration
-                self.linear_accel_mag = float(np.sqrt(
-                    la.x**2 + la.y**2 + la.z**2))
+                accel_mag = float(np.sqrt(la.x**2 + la.y**2 + la.z**2))
 
-                # Calibration: collect baseline orientation
-                if not self.calibrated:
-                    self.calib_quats.append(self.pitch)
-                    if len(self.calib_quats) >= self.CALIB_COUNT:
-                        self.baseline_pitch = float(np.mean(self.calib_quats))
-                        self.calibrated = True
-                        print(f"IMU calibrated. Baseline pitch: "
-                              f"{np.degrees(self.baseline_pitch):.2f}°")
-                    continue
-
-                # ZUPT: buffer accel samples when active
+                timestamp = None
                 if self._zupt_active:
-                    t = imu_data.linearAcceleration.getTimestampDevice() \
-                        .total_seconds()
-                    if self._prev_time is not None:
-                        dt = t - self._prev_time
-                        if 0 < dt < 0.1:
-                            self._zupt_accel_y.append(la.y)
-                            self._zupt_dt.append(dt)
-                    self._prev_time = t
+                    timestamp = la.getTimestampDevice().total_seconds()
+
+                self.process_sample(pitch, accel_mag, la.y, timestamp)
 
         self.pending.clear()
 
@@ -471,48 +574,128 @@ class BlowDetector:
 
 
 # ============================================================
-# MAIN
+# FRAME PROCESSING (shared by OAK-D and RealSense)
 # ============================================================
 
-def main():
-    pipeline = build_pipeline()
+def process_frame(frame, timestamp, camera_matrix, dist_coeffs,
+                  imu_helper, blow_detector, writer, csv_file,
+                  frame_count, start_time):
+    """Process one frame: pose estimation, blow detection, overlays, CSV."""
+    rvec, tvec, inlier_ratio, frame = estimate_pose(
+        frame, camera_matrix, dist_coeffs)
 
-    # Connect to device
+    blow = False
+    velocity = 0.0
+
+    if tvec is not None:
+        tilt_corr = imu_helper.get_tilt_correction(tvec)
+        disp_corr = imu_helper.get_displacement_y()
+        height = -float(tvec[1]) + tilt_corr - disp_corr
+
+        weight = imu_helper.get_stillness_weight()
+        velocity, blow, set_per_blow, drop_available = blow_detector.update(
+            timestamp, height, stillness_weight=weight)
+
+        if blow:
+            imu_helper.start_zupt()
+        if blow_detector._awaiting_rest and \
+           blow_detector._settle_count == blow_detector.SETTLE_FRAMES:
+            imu_helper.finish_zupt()
+
+        if inlier_ratio > 0.7 and abs(velocity) < 0.10:
+            imu_helper.reset_tilt()
+
+        # Overlay
+        cv2.putText(frame, f"Height:   {height:.3f}m",
+                    (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"Velocity: {velocity:+.2f}m/s",
+                    (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        drop_color = (0, 255, 0) if drop_available > blow_detector.MIN_DROP_HEIGHT else (100, 100, 100)
+        cv2.putText(frame, f"Drop avail: {drop_available:.2f}m",
+                    (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, drop_color, 2)
+        cv2.putText(frame, f"Blows: {blow_detector.blow_count}",
+                    (10, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        last_set_str = f"{blow_detector.last_set_mm:.1f}mm" if blow_detector.last_set_mm is not None else "--"
+        cv2.putText(frame, f"Last set: {last_set_str}",
+                    (10, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        writer.writerow([f"{timestamp:.4f}", f"{height:.4f}",
+                         f"{velocity:.4f}", int(blow),
+                         f"{set_per_blow:.1f}" if set_per_blow is not None else "",
+                         f"{inlier_ratio:.2f}"])
+        csv_file.flush()
+
+    else:
+        cv2.putText(frame, "NO DETECTION", (10, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+    # IMU status (always visible)
+    imu_status = "IMU OK" if imu_helper.is_ready else "IMU calibrating..."
+    imu_color = (0, 255, 0) if imu_helper.is_ready else (0, 165, 255)
+    cv2.putText(frame, imu_status,
+                (10, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, imu_color, 2)
+    if imu_helper.is_ready:
+        pitch_deg = np.degrees(imu_helper.pitch)
+        accel_mag = imu_helper.linear_accel_mag
+        cv2.putText(frame, f"Pitch: {pitch_deg:.2f} deg",
+                    (10, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+        cv2.putText(frame, f"Accel: {accel_mag:.3f} m/s2",
+                    (10, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+
+    # FPS counter
+    elapsed = time.time() - start_time
+    fps = frame_count / elapsed if elapsed > 0 else 0
+    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+
+    if blow:
+        cv2.rectangle(frame, (0, 0), (CAMERA_WIDTH, CAMERA_HEIGHT),
+                      (0, 255, 255), 8)
+
+    return frame, blow
+
+
+# ============================================================
+# OAK-D MAIN LOOP
+# ============================================================
+
+def run_oakd():
+    import depthai as dai
+
+    pipeline = build_pipeline()
     if DEVICE_IP:
         device_info = dai.DeviceInfo(DEVICE_IP)
-        device_ctx  = dai.Device(pipeline, device_info)
+        device_ctx = dai.Device(pipeline, device_info)
     else:
-        device_ctx  = dai.Device(pipeline)
+        device_ctx = dai.Device(pipeline)
 
     print("Connecting to OAK-D...")
 
     with device_ctx as device:
         print(f"Connected: {device.getMxId()}")
 
-        # Get factory calibration — no manual calibration needed
-        calib         = device.readCalibration()
+        calib = device.readCalibration()
         camera_matrix = np.array(calib.getCameraIntrinsics(
             dai.CameraBoardSocket.CAM_A, CAMERA_WIDTH, CAMERA_HEIGHT))
-        dist_coeffs   = np.array(calib.getDistortionCoefficients(
+        dist_coeffs = np.array(calib.getDistortionCoefficients(
             dai.CameraBoardSocket.CAM_A))
 
         print(f"Camera matrix loaded from device calibration")
         print(f"Starting at {CAMERA_FPS}fps, exposure {EXPOSURE_US}µs")
         print(f"Press Q to quit, S to save snapshot\n")
 
-        q            = device.getOutputQueue("video", maxSize=4, blocking=False)
-        imu_q        = device.getOutputQueue("imu",   maxSize=50, blocking=False)
-        blow_detector  = BlowDetector()
-        imu_helper     = IMUHelper()
+        q = device.getOutputQueue("video", maxSize=4, blocking=False)
+        imu_q = device.getOutputQueue("imu", maxSize=50, blocking=False)
+        blow_detector = BlowDetector()
+        imu_helper = IMUHelper()
 
-        # CSV logging — use a reference so we can close in finally
         csv_file = open(OUTPUT_CSV, "w", newline="")
-        writer   = csv.writer(csv_file)
+        writer = csv.writer(csv_file)
         writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
                          "blow", "set_mm", "inlier_ratio"])
 
-        frame_count  = 0
-        start_time   = time.time()
+        frame_count = 0
+        start_time = time.time()
 
         try:
             while True:
@@ -520,7 +703,7 @@ def main():
                 if pkt is None:
                     continue
 
-                frame     = pkt.getCvFrame()
+                frame = pkt.getCvFrame()
                 timestamp = time.time() - start_time
                 frame_count += 1
 
@@ -531,78 +714,10 @@ def main():
                         break
                     imu_helper.add_imu_packet(imu_pkt)
 
-                rvec, tvec, inlier_ratio, frame = estimate_pose(
-                    frame, camera_matrix, dist_coeffs)
-
-                blow          = False
-                set_per_blow  = None
-                velocity      = 0.0
-                height        = None
-
-                if tvec is not None:
-                    # tvec[1] = vertical axis, negate so up = positive
-                    # Apply tilt correction + accumulated displacement
-                    tilt_corr = imu_helper.get_tilt_correction(tvec)
-                    disp_corr = imu_helper.get_displacement_y()
-                    height = -float(tvec[1]) + tilt_corr - disp_corr
-
-                    # Weighted averaging: stillness weight from IMU
-                    weight = imu_helper.get_stillness_weight()
-                    velocity, blow, set_per_blow, drop_available = blow_detector.update(
-                        timestamp, height, stillness_weight=weight)
-
-                    # ZUPT: start tracking on blow, finish when settled
-                    if blow:
-                        imu_helper.start_zupt()
-                    if blow_detector._awaiting_rest and \
-                       blow_detector._settle_count == blow_detector.SETTLE_FRAMES:
-                        imu_helper.finish_zupt()
-
-                    # Reset tilt baseline when vision is confident during rest
-                    if inlier_ratio > 0.7 and abs(velocity) < 0.10:
-                        imu_helper.reset_tilt()
-
-                    # IMU status
-                    imu_status = "IMU OK" if imu_helper.is_ready else "IMU calibrating..."
-                    imu_color  = (0, 255, 0) if imu_helper.is_ready else (0, 165, 255)
-                    cv2.putText(frame, imu_status,
-                                (10, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, imu_color, 2)
-
-                    # Overlay
-                    cv2.putText(frame, f"Height:   {height:.3f}m",
-                                (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                    cv2.putText(frame, f"Velocity: {velocity:+.2f}m/s",
-                                (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                    # Drop available — goes green when enough height for a valid blow
-                    drop_color = (0, 255, 0) if drop_available > blow_detector.MIN_DROP_HEIGHT else (100, 100, 100)
-                    cv2.putText(frame, f"Drop avail: {drop_available:.2f}m",
-                                (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, drop_color, 2)
-                    cv2.putText(frame, f"Blows: {blow_detector.blow_count}",
-                                (10, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                    last_set_str = f"{blow_detector.last_set_mm:.1f}mm" if blow_detector.last_set_mm is not None else "--"
-                    cv2.putText(frame, f"Last set: {last_set_str}",
-                                (10, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
-                    writer.writerow([f"{timestamp:.4f}", f"{height:.4f}",
-                                     f"{velocity:.4f}", int(blow),
-                                     f"{set_per_blow:.1f}" if set_per_blow is not None else "",
-                                     f"{inlier_ratio:.2f}"])
-                    csv_file.flush()
-
-                else:
-                    cv2.putText(frame, "NO DETECTION", (10, 110),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-                # FPS counter
-                elapsed = time.time() - start_time
-                fps = frame_count / elapsed if elapsed > 0 else 0
-                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-
-                # Flash on blow
-                if blow:
-                    cv2.rectangle(frame, (0, 0), (CAMERA_WIDTH, CAMERA_HEIGHT),
-                                  (0, 255, 255), 8)
+                frame, blow = process_frame(
+                    frame, timestamp, camera_matrix, dist_coeffs,
+                    imu_helper, blow_detector, writer, csv_file,
+                    frame_count, start_time)
 
                 cv2.imshow("Hammer Tracker", frame)
                 key = cv2.waitKey(1)
@@ -618,6 +733,111 @@ def main():
             csv_file.close()
             cv2.destroyAllWindows()
             print(f"\nDone. {blow_detector.blow_count} blows logged to {OUTPUT_CSV}")
+
+
+# ============================================================
+# REALSENSE MAIN LOOP
+# ============================================================
+
+def run_realsense():
+    import pyrealsense2 as rs
+
+    print("Connecting to RealSense D435i...")
+    pipe, profile = build_realsense_pipeline()
+    camera_matrix, dist_coeffs = get_realsense_intrinsics(profile)
+
+    print(f"Camera matrix loaded from RealSense calibration")
+    print(f"Press Q to quit, S to save snapshot\n")
+
+    madgwick = MadgwickFilter(beta=0.1)
+    imu_helper = IMUHelper()
+    imu_helper.CALIB_COUNT = 100  # ~1.5s at 63Hz accel rate
+    blow_detector = BlowDetector()
+
+    csv_file = open(OUTPUT_CSV, "w", newline="")
+    writer = csv.writer(csv_file)
+    writer.writerow(["timestamp", "height_m", "velocity_ms_pos_up",
+                     "blow", "set_mm", "inlier_ratio"])
+
+    frame_count = 0
+    start_time = time.time()
+    last_gyro_ts = None
+
+    try:
+        while True:
+            frames = pipe.wait_for_frames()
+
+            # Process IMU (accel + gyro → Madgwick → pitch + linear accel)
+            accel_frame = frames.first_or_default(rs.stream.accel)
+            gyro_frame = frames.first_or_default(rs.stream.gyro)
+
+            if accel_frame and gyro_frame:
+                ad = accel_frame.as_motion_frame().get_motion_data()
+                gd = gyro_frame.as_motion_frame().get_motion_data()
+
+                accel = np.array([ad.x, ad.y, ad.z])
+                gyro = np.array([gd.x, gd.y, gd.z])
+
+                t_now = gyro_frame.get_timestamp() / 1000.0  # ms → s
+                dt = (t_now - last_gyro_ts) if last_gyro_ts is not None else 0.005
+                last_gyro_ts = t_now
+
+                if 0 < dt < 0.1:
+                    madgwick.update(gyro, accel, dt)
+
+                pitch = madgwick.get_pitch()
+                lin_accel = madgwick.remove_gravity(accel)
+                lin_mag = float(np.linalg.norm(lin_accel))
+                imu_helper.process_sample(pitch, lin_mag, lin_accel[1], t_now)
+
+            # Get color frame
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                continue
+
+            frame = np.asanyarray(color_frame.get_data())
+            timestamp = time.time() - start_time
+            frame_count += 1
+
+            frame, blow = process_frame(
+                frame, timestamp, camera_matrix, dist_coeffs,
+                imu_helper, blow_detector, writer, csv_file,
+                frame_count, start_time)
+
+            cv2.imshow("Hammer Tracker", frame)
+            key = cv2.waitKey(1)
+
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                snap = f"snapshot_{int(timestamp)}.png"
+                cv2.imwrite(snap, frame)
+                print(f"Saved {snap}")
+
+    finally:
+        pipe.stop()
+        csv_file.close()
+        cv2.destroyAllWindows()
+        print(f"\nDone. {blow_detector.blow_count} blows logged to {OUTPUT_CSV}")
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Pile Driving Hammer Tracker")
+    parser.add_argument("--intel", action="store_true",
+                        help="Use RealSense D435i instead of OAK-D")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.intel:
+        run_realsense()
+    else:
+        run_oakd()
 
 
 if __name__ == "__main__":
